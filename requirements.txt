@@ -2,3 +2,6 @@ streamlit
 numpy
 librosa
 soundfile
+scipy
+audioread
+yt-dlp
