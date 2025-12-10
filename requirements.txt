@@ -4,4 +4,3 @@ librosa
 soundfile
 scipy
 audioread
-yt-dlp
