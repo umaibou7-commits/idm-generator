@@ -4,18 +4,54 @@ import librosa
 import soundfile as sf
 import io
 import tempfile
+import os
+import glob
+
+# Optional: YouTubeダウンロード用
+try:
+    import yt_dlp  # type: ignore
+    YT_AVAILABLE = True
+except Exception:
+    yt_dlp = None
+    YT_AVAILABLE = False
 
 # =========================
 # 音階定義
 # =========================
 SCALES = {
-    "minor": [0, 2, 3, 5, 7, 8, 10],
+    "minor": [0, 2, 3,5, 7, 8, 10],
     "major": [0, 2, 4, 5, 7, 9, 11],
     "pentatonic": [0, 2, 4, 7, 9],
     "blues": [0, 3, 5, 6, 7, 10],
     "dorian": [0, 2, 3, 5, 7, 9, 10],
     "phrygian": [0, 1, 3, 5, 7, 8, 10],
     "chromatic": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+}
+
+# =========================
+# DnB キック＆スネアパターン
+# =========================
+DNB_PATTERNS = {
+    "クラシック2ステップ": {
+        "kicks": [0.0, 1.5],
+        "snares": [1.0, 3.0],
+    },
+    "ローラー": {
+        "kicks": [0.0, 1.25, 2.75],
+        "snares": [1.0, 3.0],
+    },
+    "アーメン風": {
+        "kicks": [0.0, 1.5, 2.0],
+        "snares": [1.0, 2.75],
+    },
+    "ハーフタイムドロップ": {
+        "kicks": [0.0, 2.0],
+        "snares": [2.5],
+    },
+    "マイクロステップ": {
+        "kicks": [0.0, 1.75, 2.25],
+        "snares": [1.0, 3.0],
+    },
 }
 
 
@@ -30,14 +66,41 @@ def get_scale_notes(root_midi, scale_name, count):
 
 
 # =========================
+# YouTube から音声を取得
+# =========================
+def load_audio_from_youtube(url: str, sr_target: int | None = None):
+    if not YT_AVAILABLE:
+        raise ImportError("yt_dlp がインストールされていないため YouTube からの取得は使えません。")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        outtmpl = os.path.join(tmpdir, "audio.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+
+        # ダウンロードされたファイルを探す
+        candidates = glob.glob(os.path.join(tmpdir, "audio.*"))
+        if not candidates:
+            raise RuntimeError("YouTube から音声ファイルを取得できませんでした。")
+        audio_path = candidates[0]
+
+        audio, sr = librosa.load(audio_path, sr=sr_target, mono=True)
+        return audio, sr
+
+
+# =========================
 # ソース音声の解析（キック / 声ネタ候補）
 # =========================
 def analyze_source_for_percussion_and_voice(audio, sr):
-    """元音源からキック候補と声ネタ候補をざっくり抽出"""
     hop_length = 512
     n_fft = 2048
 
-    # 特徴量計算
     onset_env = librosa.onset.onset_strength(y=audio, sr=sr, hop_length=hop_length)
     onset_frames = librosa.onset.onset_detect(
         onset_envelope=onset_env, sr=sr, hop_length=hop_length
@@ -69,10 +132,8 @@ def analyze_source_for_percussion_and_voice(audio, sr):
             continue
         e = rms[f]
         c = centroid[f]
-        # ざっくり低域・高エネルギー → キック候補
         if e > energy_mean * 1.2 and c < cent_mean * 0.7:
             kick_idx.append(f)
-        # ざっくり中高域・そこそこエネルギー → 声ネタ / リード候補
         elif e > energy_mean * 0.9 and c > cent_mean * 1.2:
             voice_idx.append(f)
 
@@ -99,7 +160,7 @@ def analyze_source_for_percussion_and_voice(audio, sr):
 
 
 # =========================
-# 原曲を細かく刻んで再構成するグラニュラー処理
+# グラニュラー処理
 # =========================
 def make_granular_layer(
     audio,
@@ -124,7 +185,6 @@ def make_granular_layer(
     if onset_samples is not None and onset_samples.size > 0:
         candidates = onset_samples.copy()
     else:
-        # フォールバック：ほぼ等間隔
         candidates = np.arange(0, length - grain_len, hop, dtype=int)
 
     candidates = candidates[candidates < length - grain_len]
@@ -165,11 +225,10 @@ def make_granular_layer(
 
 
 # =========================
-# Aphex Twin 風のシンセ／ドラム生成
+# Aphex Twin 風
 # =========================
 def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
     result = np.zeros(length, dtype=np.float32)
-
     bass_notes = get_scale_notes(36, scale, 8)
     note_length = max(1, length // len(bass_notes))
 
@@ -234,7 +293,7 @@ def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
 
 
 # =========================
-# Squarepusher 風のブレイクビート／ベース
+# Squarepusher 風
 # =========================
 def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
     result = np.zeros(length, dtype=np.float32)
@@ -252,7 +311,6 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
         if bar_start >= length:
             break
 
-        # キック
         for pos in pattern:
             idx = int(bar_start + pos * beat_samples)
             if idx >= length:
@@ -266,7 +324,6 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
             kick = np.sin(2.0 * np.pi * 55.0 * t) * np.exp(-25.0 * t)
             result[idx:end] += kick * 0.7
 
-        # スネア
         for pos in [0.5, 1.5, 2.5, 3.5]:
             idx = int(bar_start + pos * beat_samples)
             if idx >= length:
@@ -279,7 +336,6 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
             noise = (rng.random(n).astype(np.float32) - 0.5) * 0.4
             result[idx:end] += noise
 
-        # ハイハット
         for i in range(32):
             idx = int(bar_start + i * beat_samples / 8.0)
             if idx >= length:
@@ -292,7 +348,6 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
             noise = (rng.random(n).astype(np.float32) - 0.5) * 0.08
             result[idx:end] += noise
 
-    # ベースライン
     bass_notes = get_scale_notes(40, scale, 12)
     note_length = max(1, length // len(bass_notes))
 
@@ -311,7 +366,6 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
         sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
         result[start:end] += (0.5 * saw + 0.3 * sub) * envelope * float(bass) * 0.15
 
-    # メロディ
     if complexity > 5:
         melody_notes = get_scale_notes(64, scale, 16)
         melody_length = max(1, length // len(melody_notes))
@@ -333,50 +387,113 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
 
 
 # =========================
-# アシッド 303 風レイヤー
+# 新しい 303 風アシッドシンセ
 # =========================
-def apply_acid_layer(length, sr, tempo, scale, acid_amount, rng):
+def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
     if acid_amount <= 0.0:
         return np.zeros(length, dtype=np.float32)
 
     acid_amount = float(acid_amount)
 
-    steps = 16
-    step_len = max(1, length // steps)
-    notes = get_scale_notes(60, scale, steps)
+    # 想定BPMと16分音符の長さ
+    bpm = 130.0 * tempo
+    seconds_per_beat = 60.0 / max(1e-3, bpm)
+    samples_per_16th = int(sr * seconds_per_beat / 4.0)
+    if samples_per_16th <= 0:
+        samples_per_16th = int(sr * 60.0 / (130.0 * 4.0))
+
+    total_steps = max(8, length // samples_per_16th)
+    # ベースとなるスケールから 303 用の音階
+    scale_notes = get_scale_notes(48, scale, 8)  # 低めのレンジ
+    pattern_notes = []
+    accents = []
+    slides = []
+    gates = []
+
+    for step in range(total_steps):
+        # ある程度同じトニック周りをウロウロさせる
+        base_note = float(scale_notes[step % len(scale_notes)])
+        # たまにオクターブ上
+        if rng.random() < 0.25:
+            base_note += 12.0
+        # たまにオクターブ下
+        if rng.random() < 0.1:
+            base_note -= 12.0
+        pattern_notes.append(base_note)
+
+        # accent / slide / gate
+        accents.append(rng.random() < 0.3)
+        slides.append(rng.random() < 0.25)
+        # ゲート長（1.0でフル、0.4くらいまで短く）
+        gates.append(0.4 + 0.6 * rng.random())
+
+    pattern_notes = np.array(pattern_notes, dtype=np.float32)
+    accents = np.array(accents, dtype=bool)
+    slides = np.array(slides, dtype=bool)
+    gates = np.array(gates, dtype=np.float32)
 
     out = np.zeros(length, dtype=np.float32)
 
-    for i in range(steps):
-        start = i * step_len
-        end = min((i + 1) * step_len, length)
+    phase = 0.0
+    two_pi = 2.0 * np.pi
+
+    for step in range(total_steps):
+        start = step * samples_per_16th
+        if start >= length:
+            break
+        end = min((step + 1) * samples_per_16th, length)
         n = end - start
         if n <= 0:
             continue
 
-        # 一部は休符にしてリズムを作る
-        if rng.random() < 0.2:
+        gate = gates[step]
+        gate_n = int(n * gate)
+        if gate_n <= 0:
             continue
 
-        t = np.arange(n, dtype=np.float32) / sr
-        freq = 440.0 * (2.0 ** ((notes[i] - 69.0) / 12.0))
+        # ノートの開始・終了周波数
+        freq_start = 440.0 * (2.0 ** ((pattern_notes[step] - 69.0) / 12.0))
+        if step < total_steps - 1 and slides[step]:
+            freq_end = 440.0 * (2.0 ** ((pattern_notes[step + 1] - 69.0) / 12.0))
+        else:
+            freq_end = freq_start
 
-        base = np.sin(2.0 * np.pi * freq * t) + 0.5 * np.sin(
-            2.0 * np.pi * 2 * freq * t
-        )
+        freqs = np.linspace(freq_start, freq_end, gate_n, dtype=np.float32)
+        phase_increments = two_pi * freqs / sr
 
-        env = np.exp(-4.0 * t / (step_len / sr + 1e-6))
-        accent = 1.0 + 0.7 * rng.random()
+        # フェーズの累積（stepごとに連続させる）
+        local_phase = phase + np.cumsum(phase_increments)
+        phase = float(local_phase[-1])
 
-        shaped = np.tanh(base * (3.0 + 4.0 * acid_amount)) * env * accent
+        # 303は鋸歯波なので saw を生成
+        saw = 2.0 * (local_phase / two_pi - np.floor(local_phase / two_pi + 0.5))
 
-        out[start:end] += shaped * (0.3 + 0.7 * acid_amount)
+        # エンベロープ：アタック早め、リリース中程度
+        t = np.linspace(0.0, 1.0, gate_n, dtype=np.float32)
+        env = np.exp(-4.0 * t)
+        env[: max(1, int(0.05 * gate_n))] *= np.linspace(0.0, 1.0, max(1, int(0.05 * gate_n)))
+
+        # アクセントで音量と「歪み」を強める
+        accent_gain = 1.0
+        drive = 2.0 + 4.0 * acid_amount
+        if accents[step]:
+            accent_gain = 1.3 + 0.7 * acid_amount
+            drive *= 1.3
+
+        wave = np.tanh(saw * drive) * env * accent_gain
+
+        # 簡易レゾナンスっぽいEQ（高域少し持ち上げる）
+        hp = np.zeros_like(wave)
+        hp[1:] = wave[1:] - 0.98 * wave[:-1]
+        wave = 0.6 * wave + 0.7 * hp
+
+        out[start : start + gate_n] += wave * (0.4 + 0.6 * acid_amount)
 
     return out
 
 
 # =========================
-# アシッド・ハウス寄りのコアパターン
+# アシッド・ハウス寄り
 # =========================
 def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
     result = np.zeros(length, dtype=np.float32)
@@ -456,7 +573,124 @@ def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
 
 
 # =========================
-# 元音源からキックを抜き出してキックレイヤーを作る
+# Drum'n'Bass コア
+# =========================
+def apply_dnb_core(length, sr, tempo, scale, bass, complexity, pattern_name, rng):
+    result = np.zeros(length, dtype=np.float32)
+
+    bpm = 172.0 * float(tempo)
+    beat_samples = int(sr * 60.0 / bpm)
+    if beat_samples <= 0:
+        beat_samples = int(sr * 60.0 / 172.0)
+
+    pattern_def = DNB_PATTERNS.get(pattern_name, DNB_PATTERNS["クラシック2ステップ"])
+    base_kicks = pattern_def["kicks"]
+    base_snares = pattern_def["snares"]
+
+    num_bars = int(length / (beat_samples * 4)) + 1
+
+    for bar in range(num_bars):
+        bar_start = bar * beat_samples * 4
+        if bar_start >= length:
+            break
+
+        bar_offset = 0.0
+        if complexity >= 7 and bar % 2 == 1:
+            bar_offset = 0.125
+
+        kicks = base_kicks
+        snares = base_snares
+
+        for pos in kicks:
+            pos_eff = pos + (bar_offset if rng.random() < 0.4 else 0.0)
+            idx = int(bar_start + pos_eff * beat_samples)
+            if idx >= length:
+                continue
+            kick_len = int(sr * 0.08)
+            end = min(idx + kick_len, length)
+            n = end - idx
+            if n <= 0:
+                continue
+            t = np.arange(n, dtype=np.float32) / sr
+            osc = np.sin(2.0 * np.pi * 65.0 * t) * np.exp(-18.0 * t)
+            click = (rng.random(n).astype(np.float32) - 0.5) * np.exp(-80.0 * t)
+            kick = osc * 0.9 + click * 0.3
+            result[idx:end] += kick * 0.9
+
+        for pos in snares:
+            pos_eff = pos + (bar_offset if rng.random() < 0.3 else 0.0)
+            idx = int(bar_start + pos_eff * beat_samples)
+            if idx >= length:
+                continue
+            snare_len = int(sr * 0.12)
+            end = min(idx + snare_len, length)
+            n = end - idx
+            if n <= 0:
+                continue
+            t = np.arange(n, dtype=np.float32) / sr
+            tone = np.sin(2.0 * np.pi * 200.0 * t) * np.exp(-20.0 * t)
+            noise = (rng.random(n).astype(np.float32) - 0.5) * np.exp(-25.0 * t)
+            snare = tone * 0.4 + noise * 0.9
+            result[idx:end] += snare * 0.85
+
+        if complexity >= 6:
+            ghost_positions = [p + 0.25 for p in kicks] + [p - 0.25 for p in snares]
+            for pos in ghost_positions:
+                if pos <= 0 or pos >= 4:
+                    continue
+                idx = int(bar_start + pos * beat_samples)
+                if idx >= length:
+                    continue
+                glen = int(sr * 0.05)
+                end = min(idx + glen, length)
+                n = end - idx
+                if n <= 0:
+                    continue
+                t = np.arange(n, dtype=np.float32) / sr
+                env = np.exp(-30.0 * t)
+                noise = (rng.random(n).astype(np.float32) - 0.5) * env
+                result[idx:end] += noise * 0.25
+
+        for i in range(16):
+            idx = int(bar_start + i * beat_samples / 4.0)
+            if idx >= length:
+                continue
+            hat_len = int(sr * 0.03)
+            end = min(idx + hat_len, length)
+            n = end - idx
+            if n <= 0:
+                continue
+            t = np.arange(n, dtype=np.float32) / sr
+            noise = (rng.random(n).astype(np.float32) - 0.5)
+            env = np.exp(-60.0 * t)
+            amp = 0.25 + 0.1 * np.sin(2.0 * np.pi * i / 16.0)
+            result[idx:end] += noise * env * amp
+
+    bass_notes = get_scale_notes(38, scale, num_bars)
+    bar_len = max(1, length // max(1, len(bass_notes)))
+    for i, note in enumerate(bass_notes):
+        start = i * bar_len
+        end = min((i + 1) * bar_len, length)
+        if start >= length:
+            break
+        n = end - start
+        if n <= 0:
+            continue
+        t = np.arange(n, dtype=np.float32) / sr
+        freq = 440.0 * (2.0 ** ((note - 69.0) / 12.0))
+        detune = freq * 0.01
+        osc1 = np.sin(2.0 * np.pi * (freq - detune) * t)
+        osc2 = np.sin(2.0 * np.pi * (freq + detune) * t)
+        env = np.exp(-1.5 * t / (bar_len / sr + 1e-6))
+        bass_sig = (osc1 + osc2) * 0.5
+        bass_sig = np.tanh(bass_sig * 2.0)
+        result[start:end] += bass_sig * env * float(bass) * 0.22
+
+    return result
+
+
+# =========================
+# 元音源からキックを抜き出す
 # =========================
 def make_kick_layer_from_source(length, sr, audio, kick_positions, bpm, strength, rng):
     if strength <= 0.0 or kick_positions is None or len(kick_positions) == 0:
@@ -488,7 +722,7 @@ def make_kick_layer_from_source(length, sr, audio, kick_positions, bpm, strength
 
 
 # =========================
-# 元音源から声ネタっぽい部分を抜き出して散りばめる
+# 声ネタレイヤー
 # =========================
 def make_voice_layer_from_source(audio, sr, length, voice_positions, level, rng):
     if level <= 0.0 or voice_positions is None or len(voice_positions) == 0:
@@ -511,7 +745,6 @@ def make_voice_layer_from_source(audio, sr, length, voice_positions, level, rng)
         if len(snip) <= 32:
             continue
 
-        # ローパス成分を引いて簡易ハイパス（声ネタ・上モノ感）
         smooth = np.convolve(snip, kernel, mode="same")
         snip_hp = snip - smooth
 
@@ -526,7 +759,7 @@ def make_voice_layer_from_source(audio, sr, length, voice_positions, level, rng)
 
 
 # =========================
-# 簡易アレンジ（セクション別のメリハリ＋フェード＋サイドチェイン）
+# アレンジ・ミックス
 # =========================
 def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=None, sidechain_depth=0.0):
     length = len(core)
@@ -537,11 +770,6 @@ def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=
     acid_gain = np.ones(length, dtype=np.float32)
     voice_gain = np.ones(length, dtype=np.float32)
 
-    # セクション：
-    # 0.0-0.2: イントロ（グラニュラー＋少しパッド）
-    # 0.2-0.5: グルーヴ1（フル）
-    # 0.5-0.7: ブレイク（ドラム抑えめ＋声ネタ）
-    # 0.7-1.0: グルーヴ2（少し強め）
     intro = (t < 0.2)
     groove1 = (t >= 0.2) & (t < 0.5)
     breakd = (t >= 0.5) & (t < 0.7)
@@ -549,16 +777,16 @@ def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=
 
     core_gain[intro] *= 0.3
     granular_gain[intro] *= 0.7
-    acid_gain[intro] *= 0.4
+    acid_gain[intro] *= 0.5
     voice_gain[intro] *= 0.3
 
     core_gain[groove1] *= 1.0
     granular_gain[groove1] *= 0.9
-    acid_gain[groove1] *= 0.8
+    acid_gain[groove1] *= 0.9
     voice_gain[groove1] *= 0.4
 
     core_gain[breakd] *= 0.3
-    granular_gain[breakd] *= 0.7
+    granular_gain[breakd] *= 0.8
     acid_gain[breakd] *= 0.6
     voice_gain[breakd] *= 1.0
 
@@ -575,7 +803,6 @@ def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=
         + voice * voice_gain
     )
 
-    # サイドチェイン的なうねり
     if bpm_for_sidechain is not None and sidechain_depth > 0.0:
         beat_samples = int(sr * 60.0 / bpm_for_sidechain)
         if beat_samples > 0:
@@ -583,7 +810,6 @@ def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=
             side_env = np.tile(env_beat, int(np.ceil(length / beat_samples)))[:length]
             mixed = mixed * (1.0 - sidechain_depth + sidechain_depth * side_env)
 
-    # 全体のフェードイン・アウト
     fade_in = np.clip(t / 0.05, 0.0, 1.0)
     fade_out = np.clip((1.0 - t) / 0.1, 0.0, 1.0)
     env_master = np.minimum(fade_in, fade_out)
@@ -609,6 +835,7 @@ def generate_idm_array(
     idm_mode,
     acid_amount,
     voice_amount,
+    dnb_pattern_name,
 ):
     if audio.size == 0:
         raise ValueError("音声データが空です。")
@@ -633,10 +860,8 @@ def generate_idm_array(
 
     length = len(audio)
 
-    # 解析（キック / 声ネタ / オンセット）
     analysis = analyze_source_for_percussion_and_voice(audio, sr)
 
-    # IDMモードによるざっくりキャラ調整
     tempo_eff = float(tempo)
     glitch_eff = float(glitch)
     complexity_eff = int(complexity)
@@ -657,15 +882,15 @@ def generate_idm_array(
         bass_eff *= 1.2
         acid_eff = min(1.0, acid_eff * 1.4 + 0.1)
 
-    # BPM決定（サイドチェインなどにも使う）
     if style == "Aphex Twin":
         base_bpm = 120.0 * tempo_eff
     elif style == "Squarepusher":
         base_bpm = 170.0 * tempo_eff
-    else:  # Acid House
+    elif style == "Acid House":
         base_bpm = 130.0 * tempo_eff
+    else:
+        base_bpm = 172.0 * tempo_eff
 
-    # グラニュラー・レイヤー（原曲を分解して再構成）
     granular = make_granular_layer(
         audio,
         sr,
@@ -675,7 +900,6 @@ def generate_idm_array(
         onset_samples=analysis["onset_samples"],
     )
 
-    # IDM コア
     if style == "Aphex Twin":
         core = apply_aphex_style(
             length,
@@ -696,7 +920,7 @@ def generate_idm_array(
             complexity=complexity_eff,
             rng=rng,
         )
-    else:  # Acid House
+    elif style == "Acid House":
         core = apply_acid_house_core(
             length,
             sr,
@@ -705,25 +929,33 @@ def generate_idm_array(
             bass=bass_eff,
             rng=rng,
         )
+    else:
+        core = apply_dnb_core(
+            length,
+            sr,
+            tempo=tempo_eff,
+            scale=scale,
+            bass=bass_eff,
+            complexity=complexity_eff,
+            pattern_name=dnb_pattern_name,
+            rng=rng,
+        )
 
-    # 元音源キックレイヤー
     kick_layer = make_kick_layer_from_source(
         length,
         sr,
         audio,
         analysis["kick_samples"],
         bpm=base_bpm,
-        strength=0.5,
+        strength=0.5 if style != "Drum'n'Bass" else 0.2,
         rng=rng,
     )
     core = core + kick_layer
 
-    # 原曲はテクスチャとして薄く残す
     original_level = 0.08 + 0.12 * (1.0 - glitch_eff)
     original_layer = audio * original_level
 
-    # アシッドライン
-    acid_layer = apply_acid_layer(
+    acid_layer = apply_acid_303(
         length,
         sr,
         tempo=tempo_eff,
@@ -732,7 +964,6 @@ def generate_idm_array(
         rng=rng,
     )
 
-    # 声ネタレイヤー
     voice_layer = make_voice_layer_from_source(
         audio,
         sr,
@@ -750,7 +981,7 @@ def generate_idm_array(
         voice_layer,
         sr,
         bpm_for_sidechain=base_bpm,
-        sidechain_depth=0.2 if style in ("Acid House", "Squarepusher") else 0.1,
+        sidechain_depth=0.25 if style in ("Acid House", "Squarepusher", "Drum'n'Bass") else 0.1,
     )
 
     max_val = float(np.max(np.abs(processed)))
@@ -772,21 +1003,67 @@ def main():
 
     st.title("IDM Generator (Streamlit)")
     st.caption(
-        "アップロードした曲を素材に、Aphex Twin / Squarepusher / Acid House + アシッド のIDMトラックに自動変換します。"
+        "アップロードした曲や YouTube の音源を素材に、Aphex Twin / Squarepusher / Acid House / Drum'n'Bass 風のIDMトラックに自動変換します。"
     )
 
-    col_left, col_right = st.columns([1, 1.2])
+    # セッション状態（YouTube音源保管）
+    if "yt_audio" not in st.session_state:
+        st.session_state["yt_audio"] = None
+        st.session_state["yt_sr"] = None
+        st.session_state["yt_info"] = None
+
+    col_left, col_right = st.columns([1, 1.4])
 
     with col_left:
         uploaded_file = st.file_uploader(
-            "元になる音源（WAV / MP3 など）",
+            "元になる音源ファイル（WAV / MP3 など）",
             type=["wav", "mp3", "ogg", "flac", "m4a"],
         )
 
         if uploaded_file is not None:
             st.audio(uploaded_file, format="audio/*")
 
-        style = st.radio("ベースとなるスタイル", ["Aphex Twin", "Squarepusher", "Acid House"])
+        st.markdown("### または YouTube から読み込む")
+
+        yt_url = st.text_input(
+            "YouTube の URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+        )
+        yt_col1, yt_col2 = st.columns([1, 1])
+        with yt_col1:
+            yt_load = st.button("YouTube から音声を取得")
+        with yt_col2:
+            if not YT_AVAILABLE:
+                st.info("YouTube機能を使うには requirements.txt に `yt-dlp` を追加してください。")
+
+        if yt_load:
+            if not yt_url.strip():
+                st.warning("YouTube の URL を入力してください。")
+            elif not YT_AVAILABLE:
+                st.error("yt_dlp が利用できません。`yt-dlp` をインストールしてください。")
+            else:
+                with st.spinner("YouTube から音声をダウンロード中..."):
+                    try:
+                        yt_audio, yt_sr = load_audio_from_youtube(yt_url)
+                        st.session_state["yt_audio"] = yt_audio
+                        st.session_state["yt_sr"] = yt_sr
+                        st.session_state["yt_info"] = yt_url
+                        # プレビュー用に一瞬書き出して再生
+                        preview_buf = io.BytesIO()
+                        sf.write(preview_buf, yt_audio[: min(len(yt_audio), yt_sr * 30)], yt_sr, format="WAV")
+                        preview_buf.seek(0)
+                        st.success("YouTube 音源を読み込みました。")
+                        st.audio(preview_buf.read(), format="audio/wav")
+                    except Exception as e:
+                        st.error(f"YouTube 音源の取得に失敗しました: {e}")
+
+        if st.session_state["yt_audio"] is not None and uploaded_file is None:
+            st.markdown("✅ 現在のソース: YouTube 音源")
+
+        style = st.radio(
+            "ベースとなるスタイル",
+            ["Aphex Twin", "Squarepusher", "Acid House", "Drum'n'Bass"],
+        )
 
         idm_mode = st.selectbox(
             "IDMモード（ざっくりキャラクター）",
@@ -807,6 +1084,13 @@ def main():
             max_value=99999,
             value=42,
             step=1,
+        )
+
+        dnb_pattern_name = st.selectbox(
+            "D'n'Bキック＆スネアパターン（Drum'n'Bassスタイル時のみ有効）",
+            options=list(DNB_PATTERNS.keys()),
+            index=0,
+            help="クラシック2ステップ: ベーシックな2ステップ / ローラー: 転がるグルーヴ / アーメン風: Break系のノリ など",
         )
 
     with col_right:
@@ -832,7 +1116,7 @@ def main():
             3.0,
             1.5,
             0.1,
-            help="特に Squarepusher / Acid House スタイルの低音の主張に効きます。Aphex スタイルでも少し影響します。",
+            help="特に Squarepusher / Acid House / Drum'n'Bass スタイルの低音の主張に効きます。Aphex スタイルでも少し影響します。",
         )
         complexity = st.slider(
             "リズム / メロディの複雑さ",
@@ -854,7 +1138,7 @@ def main():
             "アシッドシンセの存在感（303感）",
             0.0,
             1.0,
-            0.5,
+            0.6,
             0.1,
             help="0でアシッド無し。値を上げると303っぽいウネウネしたシンセラインが前に出ます。",
         )
@@ -878,64 +1162,68 @@ def main():
         generate = st.button("IDMトラックを生成する")
 
     if generate:
-        if uploaded_file is None:
-            st.warning("先に音声ファイルをアップロードしてください。")
+        # ソースとなる音源を決定
+        source_audio = None
+        source_sr = None
+
+        if uploaded_file is not None:
+            file_bytes = uploaded_file.getvalue()
+            if not file_bytes:
+                st.error("アップロードされたファイルが空です。別のファイルを試してください。")
+                return
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            try:
+                source_audio, source_sr = librosa.load(tmp_path, sr=None, mono=True)
+            except Exception as e:
+                st.error(f"音声ファイルの読み込みに失敗しました: {e}")
+                return
+        elif st.session_state["yt_audio"] is not None:
+            source_audio = st.session_state["yt_audio"]
+            source_sr = st.session_state["yt_sr"]
         else:
-            with st.spinner("生成中..."):
-                try:
-                    file_bytes = uploaded_file.getvalue()
-                    if not file_bytes:
-                        st.error("アップロードされたファイルが空です。別のファイルを試してください。")
-                        return
+            st.warning("先に音源ファイルをアップロードするか、YouTube から読み込んでください。")
+            return
 
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-                        tmp.write(file_bytes)
-                        tmp_path = tmp.name
+        with st.spinner("IDMトラックを生成中..."):
+            try:
+                sr_out, processed = generate_idm_array(
+                    audio=source_audio,
+                    sr=source_sr,
+                    style=style,
+                    tempo=tempo,
+                    glitch=glitch,
+                    bass=bass,
+                    duration_min=duration,
+                    seed=seed,
+                    scale=scale,
+                    complexity=complexity,
+                    atmosphere=atmosphere,
+                    idm_mode=idm_mode,
+                    acid_amount=acid_amount,
+                    voice_amount=voice_amount,
+                    dnb_pattern_name=dnb_pattern_name,
+                )
+            except Exception as e:
+                st.error(f"トラック生成中にエラーが発生しました: {e}")
+                return
 
-                    try:
-                        audio, sr = librosa.load(tmp_path, sr=None, mono=True)
-                    except Exception as e:
-                        st.error(f"音声ファイルの読み込みに失敗しました: {e}")
-                        return
+            buffer = io.BytesIO()
+            sf.write(buffer, processed, sr_out, format="WAV")
+            buffer.seek(0)
 
-                    try:
-                        sr_out, processed = generate_idm_array(
-                            audio=audio,
-                            sr=sr,
-                            style=style,
-                            tempo=tempo,
-                            glitch=glitch,
-                            bass=bass,
-                            duration_min=duration,
-                            seed=seed,
-                            scale=scale,
-                            complexity=complexity,
-                            atmosphere=atmosphere,
-                            idm_mode=idm_mode,
-                            acid_amount=acid_amount,
-                            voice_amount=voice_amount,
-                        )
-                    except Exception as e:
-                        st.error(f"トラック生成中にエラーが発生しました: {e}")
-                        return
+            st.success("生成完了！")
+            audio_bytes = buffer.read()
+            st.audio(audio_bytes, format="audio/wav")
 
-                    buffer = io.BytesIO()
-                    sf.write(buffer, processed, sr_out, format="WAV")
-                    buffer.seek(0)
-
-                    st.success("生成完了！")
-                    audio_bytes = buffer.read()
-                    st.audio(audio_bytes, format="audio/wav")
-
-                    buffer = io.BytesIO(audio_bytes)
-                    st.download_button(
-                        "WAV をダウンロード",
-                        data=buffer,
-                        file_name=f"idm_{style.replace(' ', '').lower()}_{seed}.wav",
-                        mime="audio/wav",
-                    )
-                except Exception as e:
-                    st.error(f"予期しないエラーが発生しました: {e}")
+            buffer = io.BytesIO(audio_bytes)
+            st.download_button(
+                "WAV をダウンロード",
+                data=buffer,
+                file_name=f"idm_{style.replace(' ', '').lower()}_{seed}.wav",
+                mime="audio/wav",
+            )
 
 
 if __name__ == "__main__":
