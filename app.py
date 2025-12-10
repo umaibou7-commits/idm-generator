@@ -20,7 +20,6 @@ SCALES = {
 
 
 def get_scale_notes(root_midi, scale_name, count):
-    """スケールと回数から MIDI ノート列を生成"""
     scale_intervals = SCALES.get(scale_name, SCALES["minor"])
     notes = []
     for i in range(count):
@@ -34,27 +33,18 @@ def get_scale_notes(root_midi, scale_name, count):
 # 原曲を細かく刻んで再構成するグラニュラー処理
 # =========================
 def make_granular_layer(audio, sr, rng, chop_amount=0.7, texture_amount=0.7):
-    """
-    原曲を細かく刻んで並び替えるレイヤーを作る。
-    chop_amount: 0~1 刻みの激しさ（グリッチ感）
-    texture_amount: 0~1 テクスチャの粗さ（ローファイ感）
-    """
     length = len(audio)
     if length < int(sr * 0.3):
-        # 短すぎるときは何もしない
         return np.zeros_like(audio, dtype=np.float32)
 
-    # 1粒の長さ（80〜160ms）
     grain_ms = 80.0 + 80.0 * float(chop_amount)
     grain_len = int(sr * grain_ms / 1000.0)
     grain_len = max(32, min(grain_len, length // 4))
 
-    # オーバーラップ率 30〜80%
     overlap = 0.3 + 0.5 * float(texture_amount)
     hop = int(grain_len * (1.0 - overlap))
     hop = max(8, hop)
 
-    # オンセット位置（アタックのある場所）を候補にする
     try:
         onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
         onset_frames = librosa.onset.onset_frames(onset_envelope=onset_env)
@@ -69,7 +59,6 @@ def make_granular_layer(audio, sr, rng, chop_amount=0.7, texture_amount=0.7):
     out = np.zeros(length, dtype=np.float32)
     env = np.hanning(grain_len).astype(np.float32)
 
-    # 刻み密度（1〜2倍）
     density = 0.6 + 1.4 * float(chop_amount)
     effective_hop = max(4, int(hop / density))
 
@@ -81,13 +70,11 @@ def make_granular_layer(audio, sr, rng, chop_amount=0.7, texture_amount=0.7):
 
         g = audio[src_start : src_start + grain_len].astype(np.float32)
 
-        # ランダム反転
         if rng.random() < 0.5 * chop_amount:
             g = g[::-1]
 
-        # ランダムなローファイ／ビットクラッシュ的処理
         if rng.random() < 0.4 * chop_amount:
-            levels = int(8 + 8 * (1.0 - texture_amount))  # 8〜16段階
+            levels = int(8 + 8 * (1.0 - texture_amount))
             if levels > 1:
                 g = np.round(g * levels) / levels
 
@@ -108,13 +95,14 @@ def make_granular_layer(audio, sr, rng, chop_amount=0.7, texture_amount=0.7):
 def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
     result = np.zeros(length, dtype=np.float32)
 
-    # ベースライン（スケール準拠）
     bass_notes = get_scale_notes(36, scale, 8)
     note_length = max(1, length // len(bass_notes))
 
     for i, note in enumerate(bass_notes):
         start = i * note_length
         end = min((i + 1) * note_length, length)
+        if start >= length:
+            break
         n = end - start
         if n <= 0:
             continue
@@ -126,7 +114,6 @@ def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
         sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
         result[start:end] += (0.7 * sine + 0.3 * sub) * envelope * 0.18
 
-    # うねるキック
     bpm = 120.0 * float(tempo)
     beat_samples = int(sr * 60.0 / bpm)
     if beat_samples <= 0:
@@ -142,7 +129,6 @@ def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
         kick = np.sin(2.0 * np.pi * 50.0 * t) * np.exp(-14.0 * t)
         result[i:end] += kick * 0.55
 
-    # アンビエントなドローン・パッド
     i_arr = np.arange(length, dtype=np.float32)
     lfo_slow = np.sin(2.0 * np.pi * 0.25 * i_arr / sr)
     lfo_fast = np.sin(2.0 * np.pi * 0.7 * i_arr / sr)
@@ -155,7 +141,6 @@ def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
     amb_scale = 0.3 + 0.7 * (float(atmosphere) / 10.0)
     result += amb * amb_scale
 
-    # グリッチ（オーディオチャンクの反転・ゲイン変化）
     if glitch > 0.2:
         chunk_size = int(sr * (0.18 + 0.2 * glitch))
         if chunk_size > 0:
@@ -166,7 +151,7 @@ def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
                     if rng.random() < 0.5:
                         seg = seg[::-1]
                     if rng.random() < 0.5:
-                        seg *= (0.4 + 0.6 * rng.random())
+                        seg *= 0.4 + 0.6 * rng.random()
                     result[i : i + chunk_size] = seg
                 i += chunk_size
 
@@ -251,7 +236,7 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
         sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
         result[start:end] += (0.5 * saw + 0.3 * sub) * envelope * float(bass) * 0.15
 
-    # メロディ（複雑さが高いとき）
+    # メロディ
     if complexity > 5:
         melody_notes = get_scale_notes(64, scale, 16)
         melody_length = max(1, length // len(melody_notes))
@@ -273,18 +258,61 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
 
 
 # =========================
+# アシッド 303 風レイヤー
+# =========================
+def apply_acid_layer(length, sr, tempo, scale, acid_amount, rng):
+    if acid_amount <= 0.0:
+        return np.zeros(length, dtype=np.float32)
+
+    acid_amount = float(acid_amount)
+
+    steps = 16
+    step_len = max(1, length // steps)
+    notes = get_scale_notes(60, scale, steps)
+
+    out = np.zeros(length, dtype=np.float32)
+
+    for i in range(steps):
+        start = i * step_len
+        end = min((i + 1) * step_len, length)
+        n = end - start
+        if n <= 0:
+            continue
+
+        # 一部は休符にしてリズムを作る
+        if rng.random() < 0.2:
+            continue
+
+        t = np.arange(n, dtype=np.float32) / sr
+        freq = 440.0 * (2.0 ** ((notes[i] - 69.0) / 12.0))
+
+        # 2つの倍音を混ぜてから歪ませる
+        base = np.sin(2.0 * np.pi * freq * t) + 0.5 * np.sin(
+            2.0 * np.pi * 2 * freq * t
+        )
+
+        env = np.exp(-4.0 * t / (step_len / sr + 1e-6))
+        accent = 1.0 + 0.7 * rng.random()
+
+        shaped = np.tanh(base * (3.0 + 4.0 * acid_amount)) * env * accent
+
+        out[start:end] += shaped * (0.3 + 0.7 * acid_amount)
+
+    return out
+
+
+# =========================
 # 簡易アレンジ（フェードイン・アウト）
 # =========================
-def arrange_layers(core, granular, original, sr):
+def arrange_layers(core, granular, original, acid):
     length = len(core)
     t = np.linspace(0.0, 1.0, length, dtype=np.float32)
 
-    # 0〜5%でフェードイン、90〜100%でフェードアウト
     fade_in = np.clip(t / 0.05, 0.0, 1.0)
     fade_out = np.clip((1.0 - t) / 0.1, 0.0, 1.0)
     env_master = np.minimum(fade_in, fade_out)
 
-    mixed = core + granular + original
+    mixed = core + granular + original + acid
     return mixed * env_master
 
 
@@ -303,25 +331,24 @@ def generate_idm_array(
     scale,
     complexity,
     atmosphere,
+    idm_mode,
+    acid_amount,
 ):
     if audio.size == 0:
         raise ValueError("音声データが空です。")
 
     rng = np.random.default_rng(int(seed))
 
-    # 入力を軽く正規化
     max_in = float(np.max(np.abs(audio)))
     if max_in > 0:
         audio = (audio / max_in).astype(np.float32)
     else:
         audio = audio.astype(np.float32)
 
-    # 目標長（サンプル数）
     target_length = int(sr * float(duration_min) * 60.0)
     if target_length <= 0:
         target_length = len(audio)
 
-    # 長さ調整（カット or ループ）
     if len(audio) > target_length:
         audio = audio[:target_length]
     elif len(audio) < target_length:
@@ -330,45 +357,71 @@ def generate_idm_array(
 
     length = len(audio)
 
-    # グラニュラー・レイヤー（原曲を分解して再構成）
+    # IDMモードによるざっくりキャラ調整
+    tempo_eff = float(tempo)
+    glitch_eff = float(glitch)
+    complexity_eff = int(complexity)
+    bass_eff = float(bass)
+    atmosphere_eff = int(atmosphere)
+
+    if idm_mode == "アンビエント寄り":
+        tempo_eff *= 0.8
+        glitch_eff *= 0.6
+        complexity_eff = max(1, complexity_eff - 2)
+        atmosphere_eff = min(10, atmosphere_eff + 2)
+    elif idm_mode == "ブレイクコア寄り":
+        tempo_eff *= 1.4
+        glitch_eff = min(1.0, glitch_eff * 1.4 + 0.1)
+        complexity_eff = min(10, complexity_eff + 2)
+        bass_eff *= 1.2
+
+    # グラニュラー・レイヤー
     granular = make_granular_layer(
         audio,
         sr,
         rng,
-        chop_amount=float(glitch),
-        texture_amount=float(atmosphere) / 10.0,
+        chop_amount=glitch_eff,
+        texture_amount=float(atmosphere_eff) / 10.0,
     )
 
-    # IDM コア（スタイル別）
+    # IDM コア
     if style == "Aphex Twin":
         core = apply_aphex_style(
             length,
             sr,
-            tempo=float(tempo),
+            tempo=tempo_eff,
             scale=scale,
-            glitch=float(glitch),
-            atmosphere=int(atmosphere),
+            glitch=glitch_eff,
+            atmosphere=atmosphere_eff,
             rng=rng,
         )
     else:
         core = apply_squarepusher_style(
             length,
             sr,
-            tempo=float(tempo),
+            tempo=tempo_eff,
             scale=scale,
-            bass=float(bass),
-            complexity=int(complexity),
+            bass=bass_eff,
+            complexity=complexity_eff,
             rng=rng,
         )
 
-    # 原曲レイヤーはかなり控えめに（ほぼテクスチャ）
-    original_level = 0.08 + 0.12 * (1.0 - float(glitch))
+    # 原曲はテクスチャとして薄く残す
+    original_level = 0.08 + 0.12 * (1.0 - glitch_eff)
     original_layer = audio * original_level
 
-    # 全レイヤーを簡易アレンジ
-    processed = arrange_layers(core, granular, original_layer, sr)
+    # アシッドライン
+    acid_layer = apply_acid_layer(
+        length,
+        sr,
+        tempo=tempo_eff,
+        scale=scale,
+        acid_amount=acid_amount,
+        rng=rng,
+    )
 
-    # 最終正規化
+    processed = arrange_layers(core, granular, original_layer, acid_layer)
+
     max_val = float(np.max(np.abs(processed)))
     if max_val > 0:
         processed = processed * (0.98 / max_val)
@@ -388,7 +441,7 @@ def main():
 
     st.title("IDM Generator (Streamlit)")
     st.caption(
-        "アップロードした曲を素材に、Aphex Twin / Squarepusher テイストの IDM トラックに自動変換します。"
+        "アップロードした曲を素材に、Aphex Twin / Squarepusher + アシッド のIDMトラックに自動変換します。"
     )
 
     col_left, col_right = st.columns([1, 1.2])
@@ -402,13 +455,19 @@ def main():
         if uploaded_file is not None:
             st.audio(uploaded_file, format="audio/*")
 
-        style = st.radio("スタイル", ["Aphex Twin", "Squarepusher"])
+        style = st.radio("ベースとなるスタイル", ["Aphex Twin", "Squarepusher"])
+
+        idm_mode = st.selectbox(
+            "IDMモード（ざっくりキャラクター）",
+            ["標準", "アンビエント寄り", "ブレイクコア寄り"],
+            help="標準: バランス型 / アンビエント寄り: テンポ遅め・空間多め / ブレイクコア寄り: テンポ速め・グリッチ多め",
+        )
 
         scale = st.selectbox(
             "スケール（曲の雰囲気になる音階）",
             options=list(SCALES.keys()),
             index=0,
-            help="minor: 暗め / major: 明るめ / pentatonic: 和風 / それ以外は少しマニアックなモード音階です。",
+            help="minor: 暗め / major: 明るめ / pentatonic: 和風っぽい / それ以外は少しマニアックなモード音階です。",
         )
 
         seed = st.number_input(
@@ -460,6 +519,14 @@ def main():
             1,
             help="ドローンやパッドの厚み。Aphex 系の浮遊感・奥行きに効きます。",
         )
+        acid_amount = st.slider(
+            "アシッドシンセの存在感",
+            0.0,
+            1.0,
+            0.0,
+            0.1,
+            help="0でアシッド無し。値を上げると303っぽいウネウネしたシンセラインが前に出ます。",
+        )
         duration = st.slider(
             "生成時間（分）",
             1,
@@ -477,7 +544,6 @@ def main():
         else:
             with st.spinner("生成中..."):
                 try:
-                    # ファイルを一度バイト列として取得してから一時ファイルに保存
                     file_bytes = uploaded_file.getvalue()
                     if not file_bytes:
                         st.error("アップロードされたファイルが空です。別のファイルを試してください。")
@@ -506,12 +572,13 @@ def main():
                             scale=scale,
                             complexity=complexity,
                             atmosphere=atmosphere,
+                            idm_mode=idm_mode,
+                            acid_amount=acid_amount,
                         )
                     except Exception as e:
                         st.error(f"トラック生成中にエラーが発生しました: {e}")
                         return
 
-                    # WAV バイナリに変換
                     buffer = io.BytesIO()
                     sf.write(buffer, processed, sr_out, format="WAV")
                     buffer.seek(0)
@@ -520,7 +587,6 @@ def main():
                     audio_bytes = buffer.read()
                     st.audio(audio_bytes, format="audio/wav")
 
-                    # ダウンロード用にもう一度先頭に戻す
                     buffer = io.BytesIO(audio_bytes)
                     st.download_button(
                         "WAV をダウンロード",
