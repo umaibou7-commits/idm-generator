@@ -1,409 +1,347 @@
-'use client';
+# IDM Generator - Python + Gradio version
+# Requirements (install before running):
+#   pip install gradio librosa soundfile numpy
 
-import React, { useState, useRef } from 'react';
-import {
-  Upload,
-  Play,
-  Download,
-  Zap,
-  Music,
-  Sliders,
-  RefreshCw,
-  Heart,
-  Info
-} from 'lucide-react';
+import numpy as np
+import librosa
+import gradio as gr
 
-const IDMGenerator = () => {
-  const [file, setFile] = useState<File | null>(null);
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [showInfo, setShowInfo] = useState(false);
+SCALES = {
+    "minor": [0, 2, 3, 5, 7, 8, 10],
+    "major": [0, 2, 4, 5, 7, 9, 11],
+    "pentatonic": [0, 2, 4, 7, 9],
+    "blues": [0, 3, 5, 6, 7, 10],
+    "dorian": [0, 2, 3, 5, 7, 9, 10],
+    "phrygian": [0, 1, 3, 5, 7, 8, 10],
+    "chromatic": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+}
 
-  const [style, setStyle] = useState<'aphex' | 'squarepusher'>('aphex');
-  const [tempo, setTempo] = useState(1.2);
-  const [glitch, setGlitch] = useState(0.5);
-  const [bass, setBass] = useState(1.5);
-  const [duration, setDuration] = useState(3); // 分
-  const [seed, setSeed] = useState(42);
-  const [scale, setScale] = useState<
-    'minor' | 'major' | 'pentatonic' | 'blues' | 'dorian' | 'phrygian' | 'chromatic'
-  >('minor');
-  const [complexity, setComplexity] = useState(5);
-  const [atmosphere, setAtmosphere] = useState(5);
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+def get_scale_notes(root_midi: int, scale_name: str, count: int):
+    scale_intervals = SCALES.get(scale_name, SCALES["minor"])
+    notes = []
+    for i in range(count):
+        octave = i // len(scale_intervals)
+        interval_idx = i % len(scale_intervals)
+        notes.append(root_midi + octave * 12 + scale_intervals[interval_idx])
+    return np.array(notes, dtype=np.float32)
 
-  const scales: Record<string, number[]> = {
-    minor: [0, 2, 3, 5, 7, 8, 10],
-    major: [0, 2, 4, 5, 7, 9, 11],
-    pentatonic: [0, 2, 4, 7, 9],
-    blues: [0, 3, 5, 6, 7, 10],
-    dorian: [0, 2, 3, 5, 7, 9, 10],
-    phrygian: [0, 1, 3, 5, 7, 8, 10],
-    chromatic: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
-  };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      setFile(selectedFile);
-      setAudioUrl(null);
-    }
-  };
+def apply_aphex_style(audio: np.ndarray, sr: int, tempo: float, glitch: float,
+                      atmosphere: float, scale: str, rng: np.random.Generator):
+    length = len(audio)
+    result = np.zeros_like(audio, dtype=np.float32)
 
-  const generateAudio = async () => {
-    if (!file) return;
+    # Bass notes
+    bass_notes = get_scale_notes(36, scale, 8)
+    note_length = length // len(bass_notes)
 
-    setIsGenerating(true);
-    setProgress(0);
+    for i, note in enumerate(bass_notes):
+        start = i * note_length
+        end = min((i + 1) * note_length, length)
+        if start >= length:
+            break
+        n = end - start
+        if n <= 0:
+            continue
+        t = np.arange(n, dtype=np.float32) / sr
+        freq = 440.0 * (2.0 ** ((note - 69.0) / 12.0))
+        envelope = np.exp(-2.0 * t / (note_length / sr + 1e-6))
+        sine = np.sin(2.0 * np.pi * freq * t)
+        sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
+        result[start:end] += (0.7 * sine + 0.3 * sub) * envelope * 0.15
 
-    try {
-      const AudioCtx =
-        (window as any).AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) {
-        alert('このブラウザはWeb Audio APIに対応していません。');
-        return;
-      }
+    # Kicks
+    bpm = 120.0 * tempo
+    beat_samples = int(sr * 60.0 / bpm)
+    if beat_samples <= 0:
+        beat_samples = int(sr * 60.0 / 120.0)
+    for i in range(0, length, beat_samples):
+        kick_len = int(sr * 0.15)
+        end = min(i + kick_len, length)
+        n = end - i
+        if n <= 0:
+            continue
+        t = np.arange(n, dtype=np.float32) / sr
+        kick = np.sin(2.0 * np.pi * 50.0 * t) * np.exp(-15.0 * t)
+        result[i:end] += kick * 0.4
 
-      const audioContext = new AudioCtx();
-      const arrayBuffer = await file.arrayBuffer();
+    # Drone + original
+    i_arr = np.arange(length, dtype=np.float32)
+    lfo = np.sin(2.0 * np.pi * 0.5 * i_arr / sr)
+    drone = np.sin(2.0 * np.pi * 110.0 * i_arr / sr) * (0.8 + 0.2 * lfo)
+    result += audio * 0.5 + drone * 0.1 * (atmosphere / 10.0)
 
-      // Safari互換の decodeAudioData
-      const audioBuffer = await new Promise<AudioBuffer>((resolve, reject) => {
-        // 新仕様（Promiseを返す）の場合
-        if (audioContext.decodeAudioData.length === 1) {
-          audioContext
-            .decodeAudioData(arrayBuffer)
-            .then(resolve)
-            .catch(reject);
-        } else {
-          // 旧仕様（コールバック）の場合
-          audioContext.decodeAudioData(
-            arrayBuffer,
-            (buffer: AudioBuffer) => resolve(buffer),
-            (err: any) => reject(err)
-          );
-        }
-      });
+    # Glitch
+    if glitch > 0.3:
+        chunk_size = int(sr * 0.3)
+        if chunk_size > 0:
+            i = 0
+            while i < length - chunk_size:
+                if rng.random() < glitch * 0.3:
+                    segment = result[i:i + chunk_size].copy()[::-1]
+                    result[i:i + chunk_size] = segment
+                i += chunk_size * 2
 
-      setProgress(20);
+    return result
 
-      let channelData = audioBuffer.getChannelData(0);
-      const sampleRate = audioBuffer.sampleRate;
-      const targetLength = Math.floor(sampleRate * duration * 60); // 分 → 秒
 
-      // 長さ調整（★ここを安全なやり方に修正）
-      if (channelData.length > targetLength) {
-        channelData = channelData.slice(0, targetLength);
-      } else if (channelData.length < targetLength) {
-        const repeated = new Float32Array(targetLength);
-        for (let i = 0; i < targetLength; i++) {
-          repeated[i] = channelData[i % channelData.length];
-        }
-        channelData = repeated;
-      }
+def apply_squarepusher_style(audio: np.ndarray, sr: int, tempo: float, bass: float,
+                             complexity: int, scale: str, rng: np.random.Generator):
+    length = len(audio)
+    result = np.zeros_like(audio, dtype=np.float32)
 
-      setProgress(40);
+    bpm = 170.0 * tempo
+    beat_samples = int(sr * 60.0 / bpm)
+    if beat_samples <= 0:
+        beat_samples = int(sr * 60.0 / 170.0)
 
-      let processed = new Float32Array(channelData);
+    pattern = [0, 0.5, 1, 1.25, 1.75, 2, 2.5, 2.75, 3, 3.75]
+    num_bars = int(length / (beat_samples * 4)) + 1
 
-      if (style === 'aphex') {
-        processed = applyAphexStyle(processed, sampleRate);
-      } else {
-        processed = applySquarepusherStyle(processed, sampleRate);
-      }
+    for bar in range(num_bars):
+        bar_start = bar * beat_samples * 4
+        if bar_start >= length:
+            break
 
-      setProgress(80);
+        # Kicks
+        for pos in pattern:
+            idx = int(bar_start + pos * beat_samples)
+            if idx >= length:
+                continue
+            kick_len = int(sr * 0.1)
+            end = min(idx + kick_len, length)
+            n = end - idx
+            if n <= 0:
+                continue
+            t = np.arange(n, dtype=np.float32) / sr
+            kick = np.sin(2.0 * np.pi * 55.0 * t) * np.exp(-25.0 * t)
+            result[idx:end] += kick * 0.7
 
-      // ★正規化の安全な実装（Math.max + スプレッドをやめる）
-      let max = 0;
-      for (let i = 0; i < processed.length; i++) {
-        const v = Math.abs(processed[i]);
-        if (v > max) max = v;
-      }
+        # Snares
+        for pos in [0.5, 1.5, 2.5, 3.5]:
+            idx = int(bar_start + pos * beat_samples)
+            if idx >= length:
+                continue
+            snare_len = int(sr * 0.12)
+            end = min(idx + snare_len, length)
+            n = end - idx
+            if n <= 0:
+                continue
+            noise = (rng.random(n).astype(np.float32) - 0.5) * 0.4
+            result[idx:end] += noise
 
-      if (max > 0) {
-        const scaleGain = 0.95 / max;
-        for (let i = 0; i < processed.length; i++) {
-          processed[i] *= scaleGain;
-        }
-      }
+        # Hihats
+        for i in range(32):
+            idx = int(bar_start + i * beat_samples / 8.0)
+            if idx >= length:
+                continue
+            hihat_len = int(sr * 0.03)
+            end = min(idx + hihat_len, length)
+            n = end - idx
+            if n <= 0:
+                continue
+            noise = (rng.random(n).astype(np.float32) - 0.5) * 0.08
+            result[idx:end] += noise
 
-      setProgress(90);
+    # Bass line
+    bass_notes = get_scale_notes(40, scale, 12)
+    note_length = length // len(bass_notes)
 
-      const newBuffer = audioContext.createBuffer(
-        1,
-        processed.length,
-        sampleRate
-      );
-      newBuffer.copyToChannel(processed, 0);
+    for i, note in enumerate(bass_notes):
+        start = i * note_length
+        end = min((i + 1) * note_length, length)
+        if start >= length:
+            break
+        n = end - start
+        if n <= 0:
+            continue
+        t = np.arange(n, dtype=np.float32) / sr
+        freq = 440.0 * (2.0 ** ((note - 69.0) / 12.0))
+        envelope = np.exp(-2.0 * t / (note_length / sr + 1e-6))
+        saw = 2.0 * (t * freq - np.floor(t * freq + 0.5))
+        sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
+        result[start:end] += (0.5 * saw + 0.3 * sub) * envelope * bass * 0.15
 
-      const wav = audioBufferToWav(newBuffer);
-      const blob = new Blob([wav], { type: 'audio/wav' });
-      const url = URL.createObjectURL(blob);
+    # Optional melody
+    if complexity > 5:
+        melody_notes = get_scale_notes(64, scale, 16)
+        melody_length = length // len(melody_notes)
+        for i, note in enumerate(melody_notes):
+            start = i * melody_length
+            end = min((i + 1) * melody_length, length)
+            if start >= length:
+                break
+            n = end - start
+            if n <= 0:
+                continue
+            t = np.arange(n, dtype=np.float32) / sr
+            freq = 440.0 * (2.0 ** ((note - 69.0) / 12.0))
+            envelope = np.exp(-3.0 * t / (melody_length / sr + 1e-6))
+            sine = np.sin(2.0 * np.pi * freq * t)
+            result[start:end] += sine * envelope * 0.1
 
-      setAudioUrl(url);
-      setProgress(100);
-    } catch (error) {
-      console.error('Generation error:', error);
-      alert('生成エラーが発生しました。別のファイルをお試しください。');
-    } finally {
-      setIsGenerating(false);
-    }
-  };
+    # Add original
+    result += audio * 0.25
 
-  const applyAphexStyle = (audio: Float32Array, sr: number) => {
-    const result = new Float32Array(audio.length);
+    return result
 
-    const bassNotes = getScaleNotes(36, scale, 8);
-    const noteDuration = audio.length / bassNotes.length;
 
-    for (let i = 0; i < bassNotes.length; i++) {
-      const start = Math.floor(i * noteDuration);
-      const end = Math.floor((i + 1) * noteDuration);
-      const freq = 440 * Math.pow(2, (bassNotes[i] - 69) / 12);
+def generate_idm(
+    file_path,
+    style,
+    tempo,
+    glitch,
+    bass,
+    duration,
+    seed,
+    scale,
+    complexity,
+    atmosphere,
+):
+    if file_path is None:
+        return None
 
-      for (let j = start; j < end && j < audio.length; j++) {
-        const t = (j - start) / sr;
-        const envelope = Math.exp(-2 * t / (noteDuration / sr));
-        const sine = Math.sin(2 * Math.PI * freq * t);
-        const sub = Math.sin(2 * Math.PI * freq * 0.5 * t);
-        result[j] += (0.7 * sine + 0.3 * sub) * envelope * 0.15;
-      }
-    }
+    # Seed
+    seed_int = int(seed) if seed is not None else 42
+    rng = np.random.default_rng(seed_int)
 
-    const bpm = 120 * tempo;
-    const beatDuration = Math.floor((60 / bpm) * sr);
-    for (let i = 0; i < audio.length; i += beatDuration) {
-      const kickLen = Math.floor(sr * 0.15);
-      for (let j = 0; j < kickLen && i + j < audio.length; j++) {
-        const t = j / sr;
-        const kick =
-          Math.sin(2 * Math.PI * 50 * t) * Math.exp(-15 * t);
-        result[i + j] += kick * 0.4;
-      }
-    }
+    # Load audio (mono)
+    audio, sr = librosa.load(file_path, sr=None, mono=True)
 
-    for (let i = 0; i < audio.length; i++) {
-      const lfo = Math.sin((2 * Math.PI * 0.5 * i) / sr);
-      const drone =
-        Math.sin((2 * Math.PI * 110 * i) / sr) * (0.8 + 0.2 * lfo);
-      result[i] +=
-        audio[i] * 0.5 + drone * 0.1 * (atmosphere / 10);
-    }
+    if len(audio) == 0:
+        raise ValueError("Audio file is empty")
 
-    if (glitch > 0.3) {
-      const chunkSize = Math.floor(sr * 0.3);
-      for (let i = 0; i < audio.length - chunkSize; i += chunkSize * 2) {
-        if (Math.random() < glitch * 0.3) {
-          for (
-            let j = 0;
-            j < chunkSize && i + j < audio.length;
-            j++
-          ) {
-            const srcIndex = i + chunkSize - j;
-            if (srcIndex < audio.length) {
-              result[i + j] = result[srcIndex];
-            }
-          }
-        }
-      }
-    }
+    # Target length (samples)
+    target_length = int(sr * float(duration) * 60.0)
+    if target_length <= 0:
+        target_length = len(audio)
 
-    return result;
-  };
+    # Adjust length (repeat or cut)
+    if len(audio) > target_length:
+        audio = audio[:target_length]
+    elif len(audio) < target_length:
+        reps = int(np.ceil(target_length / len(audio)))
+        audio = np.tile(audio, reps)[:target_length]
 
-  const applySquarepusherStyle = (audio: Float32Array, sr: number) => {
-    const result = new Float32Array(audio.length);
+    audio = audio.astype(np.float32)
 
-    const bpm = 170 * tempo;
-    const beatDuration = Math.floor((60 / bpm) * sr);
-    const pattern = [0, 0.5, 1, 1.25, 1.75, 2, 2.5, 2.75, 3, 3.75];
+    # Apply style
+    if style == "Aphex Twin":
+        processed = apply_aphex_style(
+            audio, sr, float(tempo), float(glitch),
+            float(atmosphere), scale, rng
+        )
+    else:
+        processed = apply_squarepusher_style(
+            audio, sr, float(tempo), float(bass),
+            int(complexity), scale, rng
+        )
 
-    for (let bar = 0; bar < audio.length / (beatDuration * 4); bar++) {
-      const barStart = bar * beatDuration * 4;
+    # Normalize
+    max_val = np.max(np.abs(processed))
+    if max_val > 0:
+        processed = processed * (0.95 / max_val)
 
-      pattern.forEach((pos) => {
-        const idx = Math.floor(barStart + pos * beatDuration);
-        if (idx < audio.length) {
-          const kickLen = Math.floor(sr * 0.1);
-          for (
-            let j = 0;
-            j < kickLen && idx + j < audio.length;
-            j++
-          ) {
-            const t = j / sr;
-            const kick =
-              Math.sin(2 * Math.PI * 55 * t) *
-              Math.exp(-25 * t);
-            result[idx + j] += kick * 0.7;
-          }
-        }
-      });
+    return (sr, processed)
 
-      [0.5, 1.5, 2.5, 3.5].forEach((pos) => {
-        const idx = Math.floor(barStart + pos * beatDuration);
-        if (idx < audio.length) {
-          const snareLen = Math.floor(sr * 0.12);
-          for (
-            let j = 0;
-            j < snareLen && idx + j < audio.length;
-            j++
-          ) {
-            const noise = (Math.random() - 0.5) * 0.4;
-            result[idx + j] += noise;
-          }
-        }
-      });
 
-      for (let i = 0; i < 32; i++) {
-        const idx = Math.floor(barStart + (i * beatDuration) / 8);
-        if (idx < audio.length) {
-          const hihatLen = Math.floor(sr * 0.03);
-          for (
-            let j = 0;
-            j < hihatLen && idx + j < audio.length;
-            j++
-          ) {
-            const noise = (Math.random() - 0.5) * 0.08;
-            result[idx + j] += noise;
-          }
-        }
-      }
-    }
+def build_ui():
+    with gr.Blocks() as demo:
+        gr.Markdown(
+            "# IDM Generator (Python)\nUpload an audio file and generate Aphex Twin / Squarepusher style IDM."
+        )
 
-    const bassNotes = getScaleNotes(40, scale, 12);
-    const noteDuration = audio.length / bassNotes.length;
+        with gr.Row():
+            with gr.Column():
+                audio_in = gr.Audio(
+                    label="Input audio",
+                    type="filepath"
+                )
+                style = gr.Radio(
+                    ["Aphex Twin", "Squarepusher"],
+                    value="Aphex Twin",
+                    label="Style"
+                )
+                scale = gr.Dropdown(
+                    list(SCALES.keys()),
+                    value="minor",
+                    label="Scale"
+                )
+            with gr.Column():
+                tempo = gr.Slider(
+                    minimum=0.8,
+                    maximum=2.5,
+                    value=1.2,
+                    step=0.1,
+                    label="Tempo multiplier"
+                )
+                glitch = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    value=0.5,
+                    step=0.05,
+                    label="Glitch amount"
+                )
+                bass = gr.Slider(
+                    minimum=0.5,
+                    maximum=3.0,
+                    value=1.5,
+                    step=0.1,
+                    label="Bass boost (Squarepusher style)"
+                )
+                duration = gr.Slider(
+                    minimum=1,
+                    maximum=8,
+                    value=3,
+                    step=1,
+                    label="Output duration (minutes)"
+                )
+                complexity = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=5,
+                    step=1,
+                    label="Complexity (Squarepusher style)"
+                )
+                atmosphere = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=5,
+                    step=1,
+                    label="Atmosphere (Aphex style)"
+                )
+                seed = gr.Number(
+                    value=42,
+                    label="Random seed"
+                )
 
-    for (let i = 0; i < bassNotes.length; i++) {
-      const start = Math.floor(i * noteDuration);
-      const end = Math.floor((i + 1) * noteDuration);
-      const freq = 440 * Math.pow(2, (bassNotes[i] - 69) / 12);
+        generate_btn = gr.Button("Generate IDM track")
+        audio_out = gr.Audio(
+            label="Generated IDM",
+            type="numpy"
+        )
 
-      for (let j = start; j < end && j < audio.length; j++) {
-        const t = (j - start) / sr;
-        const envelope = Math.exp(-2 * t / (noteDuration / sr));
-        const saw = 2 * (t * freq - Math.floor(t * freq + 0.5));
-        const sub = Math.sin(2 * Math.PI * freq * 0.5 * t);
-        result[j] +=
-          (0.5 * saw + 0.3 * sub) * envelope * bass * 0.15;
-      }
-    }
+        generate_btn.click(
+            fn=generate_idm,
+            inputs=[
+                audio_in,
+                style,
+                tempo,
+                glitch,
+                bass,
+                duration,
+                seed,
+                scale,
+                complexity,
+                atmosphere,
+            ],
+            outputs=audio_out,
+        )
 
-    if (complexity > 5) {
-      const melodyNotes = getScaleNotes(64, scale, 16);
-      const melodyDuration = audio.length / melodyNotes.length;
+    return demo
 
-      for (let i = 0; i < melodyNotes.length; i++) {
-        const start = Math.floor(i * melodyDuration);
-        const end = Math.floor((i + 1) * melodyDuration);
-        const freq = 440 * Math.pow(2, (melodyNotes[i] - 69) / 12);
 
-        for (let j = start; j < end && j < audio.length; j++) {
-          const t = (j - start) / sr;
-          const envelope = Math.exp(-3 * t / (melodyDuration / sr));
-          const sine = Math.sin(2 * Math.PI * freq * t);
-          result[j] += sine * envelope * 0.1;
-        }
-      }
-    }
-
-    for (let i = 0; i < audio.length; i++) {
-      result[i] += audio[i] * 0.25;
-    }
-
-    return result;
-  };
-
-  const getScaleNotes = (
-    rootMidi: number,
-    scaleName: string,
-    count: number
-  ) => {
-    const scaleIntervals = scales[scaleName] || scales.minor;
-    const notes: number[] = [];
-
-    for (let i = 0; i < count; i++) {
-      const octave = Math.floor(i / scaleIntervals.length);
-      const intervalIdx = i % scaleIntervals.length;
-      notes.push(
-        rootMidi + octave * 12 + scaleIntervals[intervalIdx]
-      );
-    }
-
-    return notes;
-  };
-
-  const audioBufferToWav = (buffer: AudioBuffer) => {
-    const numberOfChannels = buffer.numberOfChannels;
-    const length = buffer.length * numberOfChannels * 2;
-    const arrayBuffer = new ArrayBuffer(44 + length);
-    const view = new DataView(arrayBuffer);
-    const channels: Float32Array[] = [];
-    let pos = 0;
-
-    const setString = (str: string) => {
-      for (let i = 0; i < str.length; i++) {
-        view.setUint8(pos + i, str.charCodeAt(i));
-      }
-      pos += str.length;
-    };
-
-    const setUint16 = (data: number) => {
-      view.setUint16(pos, data, true);
-      pos += 2;
-    };
-
-    const setUint32 = (data: number) => {
-      view.setUint32(pos, data, true);
-      pos += 4;
-    };
-
-    setString('RIFF');
-    setUint32(36 + length);
-    setString('WAVE');
-    setString('fmt ');
-    setUint32(16);
-    setUint16(1);
-    setUint16(numberOfChannels);
-    setUint32(buffer.sampleRate);
-    setUint32(buffer.sampleRate * 2 * numberOfChannels);
-    setUint16(numberOfChannels * 2);
-    setUint16(16);
-    setString('data');
-    setUint32(length);
-
-    for (let i = 0; i < numberOfChannels; i++) {
-      channels.push(buffer.getChannelData(i));
-    }
-
-    let index = 44;
-    for (let i = 0; i < buffer.length; i++) {
-      for (let channel = 0; channel < numberOfChannels; channel++) {
-        let sample = Math.max(
-          -1,
-          Math.min(1, channels[channel][i])
-        );
-        sample =
-          sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-        view.setInt16(index, sample, true);
-        index += 2;
-      }
-    }
-
-    return arrayBuffer;
-  };
-
-  // ↓ JSX 部分は元コードと同じなので省略してもOKですが、
-  // 実際には今のまま貼り付ければ動きます
-  return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 text-white p-4 md:p-8">
-      {/* ここから先はあなたの元コードと同じ内容 */}
-      {/* ... （JSX 部分は省略） ... */}
-    </div>
-  );
-};
-
-export default IDMGenerator;
+if __name__ == "__main__":
+    demo = build_ui()
+    demo.launch()
