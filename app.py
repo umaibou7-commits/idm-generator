@@ -4,14 +4,12 @@ import librosa
 import soundfile as sf
 import io
 import tempfile
-import os
-import glob
 
 # =========================
 # 音階定義
 # =========================
 SCALES = {
-    "minor": [0, 2, 3,5, 7, 8, 10],
+    "minor": [0, 2, 3, 5, 7, 8, 10],
     "major": [0, 2, 4, 5, 7, 9, 11],
     "pentatonic": [0, 2, 4, 7, 9],
     "blues": [0, 3, 5, 6, 7, 10],
@@ -57,9 +55,6 @@ def get_scale_notes(root_midi, scale_name, count):
     return np.array(notes, dtype=np.float32)
 
 
-# =========================
-# ソース音声の解析（キック / 声ネタ候補）
-# =========================
 def analyze_source_for_percussion_and_voice(audio, sr):
     hop_length = 512
     n_fft = 2048
@@ -122,9 +117,6 @@ def analyze_source_for_percussion_and_voice(audio, sr):
     }
 
 
-# =========================
-# グラニュラー処理
-# =========================
 def make_granular_layer(
     audio,
     sr,
@@ -187,9 +179,6 @@ def make_granular_layer(
     return out
 
 
-# =========================
-# Aphex Twin 風
-# =========================
 def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
     result = np.zeros(length, dtype=np.float32)
     bass_notes = get_scale_notes(36, scale, 8)
@@ -255,9 +244,6 @@ def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
     return result
 
 
-# =========================
-# Squarepusher 風
-# =========================
 def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
     result = np.zeros(length, dtype=np.float32)
 
@@ -349,16 +335,12 @@ def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
     return result
 
 
-# =========================
-# 新しい 303 風アシッドシンセ
-# =========================
 def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
     if acid_amount <= 0.0:
         return np.zeros(length, dtype=np.float32)
 
     acid_amount = float(acid_amount)
 
-    # 想定BPMと16分音符の長さ
     bpm = 130.0 * tempo
     seconds_per_beat = 60.0 / max(1e-3, bpm)
     samples_per_16th = int(sr * seconds_per_beat / 4.0)
@@ -366,28 +348,21 @@ def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
         samples_per_16th = int(sr * 60.0 / (130.0 * 4.0))
 
     total_steps = max(8, length // samples_per_16th)
-    # ベースとなるスケールから 303 用の音階
-    scale_notes = get_scale_notes(48, scale, 8)  # 低めのレンジ
+    scale_notes = get_scale_notes(48, scale, 8)
     pattern_notes = []
     accents = []
     slides = []
     gates = []
 
     for step in range(total_steps):
-        # ある程度同じトニック周りをウロウロさせる
         base_note = float(scale_notes[step % len(scale_notes)])
-        # たまにオクターブ上
         if rng.random() < 0.25:
             base_note += 12.0
-        # たまにオクターブ下
         if rng.random() < 0.1:
             base_note -= 12.0
         pattern_notes.append(base_note)
-
-        # accent / slide / gate
         accents.append(rng.random() < 0.3)
         slides.append(rng.random() < 0.25)
-        # ゲート長（1.0でフル、0.4くらいまで短く）
         gates.append(0.4 + 0.6 * rng.random())
 
     pattern_notes = np.array(pattern_notes, dtype=np.float32)
@@ -414,7 +389,6 @@ def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
         if gate_n <= 0:
             continue
 
-        # ノートの開始・終了周波数
         freq_start = 440.0 * (2.0 ** ((pattern_notes[step] - 69.0) / 12.0))
         if step < total_steps - 1 and slides[step]:
             freq_end = 440.0 * (2.0 ** ((pattern_notes[step + 1] - 69.0) / 12.0))
@@ -424,19 +398,15 @@ def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
         freqs = np.linspace(freq_start, freq_end, gate_n, dtype=np.float32)
         phase_increments = two_pi * freqs / sr
 
-        # フェーズの累積（stepごとに連続させる）
         local_phase = phase + np.cumsum(phase_increments)
         phase = float(local_phase[-1])
 
-        # 303は鋸歯波なので saw を生成
         saw = 2.0 * (local_phase / two_pi - np.floor(local_phase / two_pi + 0.5))
 
-        # エンベロープ：アタック早め、リリース中程度
         t = np.linspace(0.0, 1.0, gate_n, dtype=np.float32)
         env = np.exp(-4.0 * t)
         env[: max(1, int(0.05 * gate_n))] *= np.linspace(0.0, 1.0, max(1, int(0.05 * gate_n)))
 
-        # アクセントで音量と「歪み」を強める
         accent_gain = 1.0
         drive = 2.0 + 4.0 * acid_amount
         if accents[step]:
@@ -445,7 +415,6 @@ def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
 
         wave = np.tanh(saw * drive) * env * accent_gain
 
-        # 簡易レゾナンスっぽいEQ（高域少し持ち上げる）
         hp = np.zeros_like(wave)
         hp[1:] = wave[1:] - 0.98 * wave[:-1]
         wave = 0.6 * wave + 0.7 * hp
@@ -455,9 +424,6 @@ def apply_acid_303(length, sr, tempo, scale, acid_amount, rng):
     return out
 
 
-# =========================
-# アシッド・ハウス寄り
-# =========================
 def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
     result = np.zeros(length, dtype=np.float32)
 
@@ -473,7 +439,6 @@ def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
         if bar_start >= length:
             break
 
-        # 4つ打ちキック
         for beat in range(4):
             idx = int(bar_start + beat * beat_samples)
             if idx >= length:
@@ -487,7 +452,6 @@ def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
             kick = np.sin(2.0 * np.pi * 48.0 * t) * np.exp(-12.0 * t)
             result[idx:end] += kick * 0.8
 
-        # クラップ 2拍目 & 4拍目
         for beat in [1, 3]:
             idx = int(bar_start + beat * beat_samples)
             if idx >= length:
@@ -497,11 +461,10 @@ def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
             n = end - idx
             if n <= 0:
                 continue
-            noise = (rng.random(n).astype(np.float32) - 0.5)
+            noise = (np.random.random(n).astype(np.float32) - 0.5)
             env = np.exp(-15.0 * np.arange(n, dtype=np.float32) / sr)
             result[idx:end] += noise * env * 0.6
 
-        # ハイハット（8分）
         for i in range(8):
             idx = int(bar_start + i * beat_samples / 2.0)
             if idx >= length:
@@ -511,11 +474,10 @@ def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
             n = end - idx
             if n <= 0:
                 continue
-            noise = (rng.random(n).astype(np.float32) - 0.5)
+            noise = (np.random.random(n).astype(np.float32) - 0.5)
             env = np.exp(-40.0 * np.arange(n, dtype=np.float32) / sr)
             result[idx:end] += noise * env * 0.3
 
-    # シンプルなサブベース
     bass_notes = get_scale_notes(36, scale, 4)
     bar_len = max(1, length // max(1, len(bass_notes)))
     for i, note in enumerate(bass_notes):
@@ -535,9 +497,6 @@ def apply_acid_house_core(length, sr, tempo, scale, bass, rng):
     return result
 
 
-# =========================
-# Drum'n'Bass コア
-# =========================
 def apply_dnb_core(length, sr, tempo, scale, bass, complexity, pattern_name, rng):
     result = np.zeros(length, dtype=np.float32)
 
@@ -652,9 +611,6 @@ def apply_dnb_core(length, sr, tempo, scale, bass, complexity, pattern_name, rng
     return result
 
 
-# =========================
-# 元音源からキックを抜き出す
-# =========================
 def make_kick_layer_from_source(length, sr, audio, kick_positions, bpm, strength, rng):
     if strength <= 0.0 or kick_positions is None or len(kick_positions) == 0:
         return np.zeros(length, dtype=np.float32)
@@ -684,9 +640,6 @@ def make_kick_layer_from_source(length, sr, audio, kick_positions, bpm, strength
     return layer
 
 
-# =========================
-# 声ネタレイヤー
-# =========================
 def make_voice_layer_from_source(audio, sr, length, voice_positions, level, rng):
     if level <= 0.0 or voice_positions is None or len(voice_positions) == 0:
         return np.zeros(length, dtype=np.float32)
@@ -721,9 +674,6 @@ def make_voice_layer_from_source(audio, sr, length, voice_positions, level, rng)
     return layer
 
 
-# =========================
-# アレンジ・ミックス
-# =========================
 def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=None, sidechain_depth=0.0):
     length = len(core)
     t = np.linspace(0.0, 1.0, length, dtype=np.float32)
@@ -780,9 +730,6 @@ def arrange_layers(core, granular, original, acid, voice, sr, bpm_for_sidechain=
     return mixed * env_master
 
 
-# =========================
-# メイン生成ロジック
-# =========================
 def generate_idm_array(
     audio,
     sr,
@@ -954,9 +901,6 @@ def generate_idm_array(
     return sr, processed.astype(np.float32)
 
 
-# =========================
-# Streamlit UI
-# =========================
 def main():
     st.set_page_config(
         page_title="IDM Generator",
@@ -966,14 +910,8 @@ def main():
 
     st.title("IDM Generator (Streamlit)")
     st.caption(
-        "アップロードした曲や YouTube の音源を素材に、Aphex Twin / Squarepusher / Acid House / Drum'n'Bass 風のIDMトラックに自動変換します。"
+        "アップロードした音源を素材に、Aphex Twin / Squarepusher / Acid House / Drum'n'Bass 風のIDMトラックに自動変換します。"
     )
-
-    # セッション状態（YouTube音源保管）
-    if "yt_audio" not in st.session_state:
-        st.session_state["yt_audio"] = None
-        st.session_state["yt_sr"] = None
-        st.session_state["yt_info"] = None
 
     col_left, col_right = st.columns([1, 1.4])
 
@@ -985,43 +923,6 @@ def main():
 
         if uploaded_file is not None:
             st.audio(uploaded_file, format="audio/*")
-
-        st.markdown("### または YouTube から読み込む")
-
-        yt_url = st.text_input(
-            "YouTube の URL",
-            placeholder="https://www.youtube.com/watch?v=...",
-        )
-        yt_col1, yt_col2 = st.columns([1, 1])
-        with yt_col1:
-            yt_load = st.button("YouTube から音声を取得")
-        with yt_col2:
-            if not YT_AVAILABLE:
-                st.info("YouTube機能を使うには requirements.txt に `yt-dlp` を追加してください。")
-
-        if yt_load:
-            if not yt_url.strip():
-                st.warning("YouTube の URL を入力してください。")
-            elif not YT_AVAILABLE:
-                st.error("yt_dlp が利用できません。`yt-dlp` をインストールしてください。")
-            else:
-                with st.spinner("YouTube から音声をダウンロード中..."):
-                    try:
-                        yt_audio, yt_sr = load_audio_from_youtube(yt_url)
-                        st.session_state["yt_audio"] = yt_audio
-                        st.session_state["yt_sr"] = yt_sr
-                        st.session_state["yt_info"] = yt_url
-                        # プレビュー用に一瞬書き出して再生
-                        preview_buf = io.BytesIO()
-                        sf.write(preview_buf, yt_audio[: min(len(yt_audio), yt_sr * 30)], yt_sr, format="WAV")
-                        preview_buf.seek(0)
-                        st.success("YouTube 音源を読み込みました。")
-                        st.audio(preview_buf.read(), format="audio/wav")
-                    except Exception as e:
-                        st.error(f"YouTube 音源の取得に失敗しました: {e}")
-
-        if st.session_state["yt_audio"] is not None and uploaded_file is None:
-            st.markdown("✅ 現在のソース: YouTube 音源")
 
         style = st.radio(
             "ベースとなるスタイル",
@@ -1125,31 +1026,26 @@ def main():
         generate = st.button("IDMトラックを生成する")
 
     if generate:
-        # ソースとなる音源を決定
-        source_audio = None
-        source_sr = None
+        if uploaded_file is None:
+            st.warning("先に音源ファイルをアップロードしてください。")
+            return
 
-        if uploaded_file is not None:
-            file_bytes = uploaded_file.getvalue()
-            if not file_bytes:
-                st.error("アップロードされたファイルが空です。別のファイルを試してください。")
-                return
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-                tmp.write(file_bytes)
-                tmp_path = tmp.name
+        file_bytes = uploaded_file.getvalue()
+        if not file_bytes:
+            st.error("アップロードされたファイルが空です。別のファイルを試してください。")
+            return
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        with st.spinner("IDMトラックを生成中..."):
             try:
                 source_audio, source_sr = librosa.load(tmp_path, sr=None, mono=True)
             except Exception as e:
                 st.error(f"音声ファイルの読み込みに失敗しました: {e}")
                 return
-        elif st.session_state["yt_audio"] is not None:
-            source_audio = st.session_state["yt_audio"]
-            source_sr = st.session_state["yt_sr"]
-        else:
-            st.warning("先に音源ファイルをアップロードするか、YouTube から読み込んでください。")
-            return
 
-        with st.spinner("IDMトラックを生成中..."):
             try:
                 sr_out, processed = generate_idm_array(
                     audio=source_audio,
