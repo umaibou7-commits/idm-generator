@@ -7,14 +7,6 @@ import tempfile
 import os
 import glob
 
-# Optional: YouTubeダウンロード用
-try:
-    import yt_dlp  # type: ignore
-    YT_AVAILABLE = True
-except Exception:
-    yt_dlp = None
-    YT_AVAILABLE = False
-
 # =========================
 # 音階定義
 # =========================
@@ -63,35 +55,6 @@ def get_scale_notes(root_midi, scale_name, count):
         interval_idx = i % len(scale_intervals)
         notes.append(root_midi + octave * 12 + scale_intervals[interval_idx])
     return np.array(notes, dtype=np.float32)
-
-
-# =========================
-# YouTube から音声を取得
-# =========================
-def load_audio_from_youtube(url: str, sr_target: int | None = None):
-    if not YT_AVAILABLE:
-        raise ImportError("yt_dlp がインストールされていないため YouTube からの取得は使えません。")
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        outtmpl = os.path.join(tmpdir, "audio.%(ext)s")
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": outtmpl,
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-
-        # ダウンロードされたファイルを探す
-        candidates = glob.glob(os.path.join(tmpdir, "audio.*"))
-        if not candidates:
-            raise RuntimeError("YouTube から音声ファイルを取得できませんでした。")
-        audio_path = candidates[0]
-
-        audio, sr = librosa.load(audio_path, sr=sr_target, mono=True)
-        return audio, sr
 
 
 # =========================
