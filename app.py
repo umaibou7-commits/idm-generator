@@ -5,9 +5,9 @@ import soundfile as sf
 import io
 import tempfile
 
-# -------------------------
+# =========================
 # 音階定義
-# -------------------------
+# =========================
 SCALES = {
     "minor": [0, 2, 3, 5, 7, 8, 10],
     "major": [0, 2, 4, 5, 7, 9, 11],
@@ -19,7 +19,7 @@ SCALES = {
 }
 
 
-def get_scale_notes(root_midi: int, scale_name: str, count: int) -> np.ndarray:
+def get_scale_notes(root_midi, scale_name, count):
     """スケールと回数から MIDI ノート列を生成"""
     scale_intervals = SCALES.get(scale_name, SCALES["minor"])
     notes = []
@@ -30,28 +30,91 @@ def get_scale_notes(root_midi: int, scale_name: str, count: int) -> np.ndarray:
     return np.array(notes, dtype=np.float32)
 
 
-def apply_aphex_style(
-    audio: np.ndarray,
-    sr: int,
-    tempo: float,
-    glitch: float,
-    atmosphere: float,
-    scale: str,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Aphex Twin っぽい質感を付与"""
+# =========================
+# 原曲を細かく刻んで再構成するグラニュラー処理
+# =========================
+def make_granular_layer(audio, sr, rng, chop_amount=0.7, texture_amount=0.7):
+    """
+    原曲を細かく刻んで並び替えるレイヤーを作る。
+    chop_amount: 0~1 刻みの激しさ（グリッチ感）
+    texture_amount: 0~1 テクスチャの粗さ（ローファイ感）
+    """
     length = len(audio)
-    result = np.zeros_like(audio, dtype=np.float32)
+    if length < int(sr * 0.3):
+        # 短すぎるときは何もしない
+        return np.zeros_like(audio, dtype=np.float32)
 
-    # ベースノート
+    # 1粒の長さ（80〜160ms）
+    grain_ms = 80.0 + 80.0 * float(chop_amount)
+    grain_len = int(sr * grain_ms / 1000.0)
+    grain_len = max(32, min(grain_len, length // 4))
+
+    # オーバーラップ率 30〜80%
+    overlap = 0.3 + 0.5 * float(texture_amount)
+    hop = int(grain_len * (1.0 - overlap))
+    hop = max(8, hop)
+
+    # オンセット位置（アタックのある場所）を候補にする
+    try:
+        onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
+        onset_frames = librosa.onset.onset_frames(onset_envelope=onset_env)
+        onset_samples = librosa.frames_to_samples(onset_frames)
+    except Exception:
+        onset_samples = np.arange(0, length - grain_len, hop)
+
+    onset_samples = onset_samples[onset_samples < length - grain_len]
+    if onset_samples.size < 8:
+        onset_samples = np.arange(0, length - grain_len, hop)
+
+    out = np.zeros(length, dtype=np.float32)
+    env = np.hanning(grain_len).astype(np.float32)
+
+    # 刻み密度（1〜2倍）
+    density = 0.6 + 1.4 * float(chop_amount)
+    effective_hop = max(4, int(hop / density))
+
+    pos = 0
+    while pos < length:
+        src_start = int(rng.choice(onset_samples))
+        if src_start + grain_len >= length:
+            src_start = max(0, length - grain_len - 1)
+
+        g = audio[src_start : src_start + grain_len].astype(np.float32)
+
+        # ランダム反転
+        if rng.random() < 0.5 * chop_amount:
+            g = g[::-1]
+
+        # ランダムなローファイ／ビットクラッシュ的処理
+        if rng.random() < 0.4 * chop_amount:
+            levels = int(8 + 8 * (1.0 - texture_amount))  # 8〜16段階
+            if levels > 1:
+                g = np.round(g * levels) / levels
+
+        gain = 0.4 + 0.8 * rng.random()
+        g = g * env * gain
+
+        end = min(pos + grain_len, length)
+        out[pos:end] += g[: end - pos]
+
+        pos += effective_hop
+
+    return out
+
+
+# =========================
+# Aphex Twin 風のシンセ／ドラム生成
+# =========================
+def apply_aphex_style(length, sr, tempo, scale, glitch, atmosphere, rng):
+    result = np.zeros(length, dtype=np.float32)
+
+    # ベースライン（スケール準拠）
     bass_notes = get_scale_notes(36, scale, 8)
     note_length = max(1, length // len(bass_notes))
 
     for i, note in enumerate(bass_notes):
         start = i * note_length
         end = min((i + 1) * note_length, length)
-        if start >= length:
-            break
         n = end - start
         if n <= 0:
             continue
@@ -61,58 +124,62 @@ def apply_aphex_style(
         envelope = np.exp(-2.0 * t / (note_length / sr + 1e-6))
         sine = np.sin(2.0 * np.pi * freq * t)
         sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
-        result[start:end] += (0.7 * sine + 0.3 * sub) * envelope * 0.15
+        result[start:end] += (0.7 * sine + 0.3 * sub) * envelope * 0.18
 
-    # キック
-    bpm = max(1.0, 120.0 * tempo)
+    # うねるキック
+    bpm = 120.0 * float(tempo)
     beat_samples = int(sr * 60.0 / bpm)
     if beat_samples <= 0:
         beat_samples = int(sr * 60.0 / 120.0)
 
     for i in range(0, length, beat_samples):
-        kick_len = int(sr * 0.15)
+        kick_len = int(sr * 0.16)
         end = min(i + kick_len, length)
         n = end - i
         if n <= 0:
             continue
         t = np.arange(n, dtype=np.float32) / sr
-        kick = np.sin(2.0 * np.pi * 50.0 * t) * np.exp(-15.0 * t)
-        result[i:end] += kick * 0.4
+        kick = np.sin(2.0 * np.pi * 50.0 * t) * np.exp(-14.0 * t)
+        result[i:end] += kick * 0.55
 
-    # ドローン＋元音声
+    # アンビエントなドローン・パッド
     i_arr = np.arange(length, dtype=np.float32)
-    lfo = np.sin(2.0 * np.pi * 0.5 * i_arr / sr)
-    drone = np.sin(2.0 * np.pi * 110.0 * i_arr / sr) * (0.8 + 0.2 * lfo)
-    result += audio * 0.5 + drone * 0.1 * (atmosphere / 10.0)
+    lfo_slow = np.sin(2.0 * np.pi * 0.25 * i_arr / sr)
+    lfo_fast = np.sin(2.0 * np.pi * 0.7 * i_arr / sr)
 
-    # グリッチ（区間反転）
-    if glitch > 0.01:
-        chunk_size = int(sr * 0.3)
+    drone_freq = 110.0
+    drone = np.sin(2.0 * np.pi * drone_freq * i_arr / sr) * (0.7 + 0.3 * lfo_slow)
+    pad = np.sin(2.0 * np.pi * drone_freq * 0.5 * i_arr / sr) * (0.5 + 0.5 * lfo_fast)
+
+    amb = drone * 0.15 + pad * 0.12
+    amb_scale = 0.3 + 0.7 * (float(atmosphere) / 10.0)
+    result += amb * amb_scale
+
+    # グリッチ（オーディオチャンクの反転・ゲイン変化）
+    if glitch > 0.2:
+        chunk_size = int(sr * (0.18 + 0.2 * glitch))
         if chunk_size > 0:
             i = 0
             while i < length - chunk_size:
-                if rng.random() < glitch * 0.3:
-                    segment = result[i : i + chunk_size].copy()[::-1]
-                    result[i : i + chunk_size] = segment
-                i += chunk_size * 2
+                if rng.random() < glitch * 0.35:
+                    seg = result[i : i + chunk_size].copy()
+                    if rng.random() < 0.5:
+                        seg = seg[::-1]
+                    if rng.random() < 0.5:
+                        seg *= (0.4 + 0.6 * rng.random())
+                    result[i : i + chunk_size] = seg
+                i += chunk_size
 
     return result
 
 
-def apply_squarepusher_style(
-    audio: np.ndarray,
-    sr: int,
-    tempo: float,
-    bass: float,
-    complexity: int,
-    scale: str,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Squarepusher っぽいブレイクビーツ処理"""
-    length = len(audio)
-    result = np.zeros_like(audio, dtype=np.float32)
+# =========================
+# Squarepusher 風のブレイクビート／ベース
+# =========================
+def apply_squarepusher_style(length, sr, tempo, scale, bass, complexity, rng):
+    result = np.zeros(length, dtype=np.float32)
 
-    bpm = max(1.0, 170.0 * tempo)
+    bpm = 170.0 * float(tempo)
     beat_samples = int(sr * 60.0 / bpm)
     if beat_samples <= 0:
         beat_samples = int(sr * 60.0 / 170.0)
@@ -182,9 +249,9 @@ def apply_squarepusher_style(
         envelope = np.exp(-2.0 * t / (note_length / sr + 1e-6))
         saw = 2.0 * (t * freq - np.floor(t * freq + 0.5))
         sub = np.sin(2.0 * np.pi * freq * 0.5 * t)
-        result[start:end] += (0.5 * saw + 0.3 * sub) * envelope * bass * 0.15
+        result[start:end] += (0.5 * saw + 0.3 * sub) * envelope * float(bass) * 0.15
 
-    # メロディ
+    # メロディ（複雑さが高いとき）
     if complexity > 5:
         melody_notes = get_scale_notes(64, scale, 16)
         melody_length = max(1, length // len(melody_notes))
@@ -202,27 +269,52 @@ def apply_squarepusher_style(
             sine = np.sin(2.0 * np.pi * freq * t)
             result[start:end] += sine * envelope * 0.1
 
-    # 元音声を混ぜる
-    result += audio * 0.25
-
     return result
 
 
+# =========================
+# 簡易アレンジ（フェードイン・アウト）
+# =========================
+def arrange_layers(core, granular, original, sr):
+    length = len(core)
+    t = np.linspace(0.0, 1.0, length, dtype=np.float32)
+
+    # 0〜5%でフェードイン、90〜100%でフェードアウト
+    fade_in = np.clip(t / 0.05, 0.0, 1.0)
+    fade_out = np.clip((1.0 - t) / 0.1, 0.0, 1.0)
+    env_master = np.minimum(fade_in, fade_out)
+
+    mixed = core + granular + original
+    return mixed * env_master
+
+
+# =========================
+# メイン生成ロジック
+# =========================
 def generate_idm_array(
-    audio: np.ndarray,
-    sr: int,
-    style: str,
-    tempo: float,
-    glitch: float,
-    bass: float,
-    duration_min: int,
-    seed: int,
-    scale: str,
-    complexity: int,
-    atmosphere: int,
-) -> tuple[int, np.ndarray]:
-    """波形配列から IDM トラックを生成"""
+    audio,
+    sr,
+    style,
+    tempo,
+    glitch,
+    bass,
+    duration_min,
+    seed,
+    scale,
+    complexity,
+    atmosphere,
+):
+    if audio.size == 0:
+        raise ValueError("音声データが空です。")
+
     rng = np.random.default_rng(int(seed))
+
+    # 入力を軽く正規化
+    max_in = float(np.max(np.abs(audio)))
+    if max_in > 0:
+        audio = (audio / max_in).astype(np.float32)
+    else:
+        audio = audio.astype(np.float32)
 
     # 目標長（サンプル数）
     target_length = int(sr * float(duration_min) * 60.0)
@@ -232,59 +324,61 @@ def generate_idm_array(
     # 長さ調整（カット or ループ）
     if len(audio) > target_length:
         audio = audio[:target_length]
-    elif len(audio) < target_length and len(audio) > 0:
+    elif len(audio) < target_length:
         reps = int(np.ceil(target_length / len(audio)))
         audio = np.tile(audio, reps)[:target_length]
 
-    audio = audio.astype(np.float32)
+    length = len(audio)
 
-    # スタイル適用
-    if style == "Aphex Twin 風":
-        processed = apply_aphex_style(
-            audio, sr, float(tempo), float(glitch),
-            float(atmosphere), scale, rng
+    # グラニュラー・レイヤー（原曲を分解して再構成）
+    granular = make_granular_layer(
+        audio,
+        sr,
+        rng,
+        chop_amount=float(glitch),
+        texture_amount=float(atmosphere) / 10.0,
+    )
+
+    # IDM コア（スタイル別）
+    if style == "Aphex Twin":
+        core = apply_aphex_style(
+            length,
+            sr,
+            tempo=float(tempo),
+            scale=scale,
+            glitch=float(glitch),
+            atmosphere=int(atmosphere),
+            rng=rng,
         )
     else:
-        processed = apply_squarepusher_style(
-            audio, sr, float(tempo), float(bass),
-            int(complexity), scale, rng
+        core = apply_squarepusher_style(
+            length,
+            sr,
+            tempo=float(tempo),
+            scale=scale,
+            bass=float(bass),
+            complexity=int(complexity),
+            rng=rng,
         )
 
-    # 正規化（安全な形）
-    max_val = float(np.max(np.abs(processed))) if processed.size > 0 else 0.0
+    # 原曲レイヤーはかなり控えめに（ほぼテクスチャ）
+    original_level = 0.08 + 0.12 * (1.0 - float(glitch))
+    original_layer = audio * original_level
+
+    # 全レイヤーを簡易アレンジ
+    processed = arrange_layers(core, granular, original_layer, sr)
+
+    # 最終正規化
+    max_val = float(np.max(np.abs(processed)))
     if max_val > 0:
-        processed = processed * (0.95 / max_val)
+        processed = processed * (0.98 / max_val)
 
     return sr, processed.astype(np.float32)
 
 
-def load_audio_from_uploaded(uploaded_file):
-    """アップロードファイルを安全に読み込む（mp3なども一応トライ）"""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-        tmp.write(uploaded_file.read())
-        tmp_path = tmp.name
-
-    # まず soundfile でトライ（wav, flac, ogg など）
-    try:
-        data, sr = sf.read(tmp_path, always_2d=False)
-        if data.ndim > 1:
-            audio = data.mean(axis=1)
-        else:
-            audio = data
-        return audio.astype(np.float32), int(sr)
-    except Exception:
-        pass  # 次に librosa でトライ
-
-    # librosa + audioread (mp3 / m4a など)
-    try:
-        audio, sr = librosa.load(tmp_path, sr=None, mono=True)
-        return audio.astype(np.float32), int(sr)
-    except Exception as e:
-        raise RuntimeError(
-            f"音声ファイルの読み込みに失敗しました。WAV 形式でのアップロードをおすすめします。\n詳細: {e}"
-        )
-
-
+# =========================
+# Streamlit UI
+# =========================
 def main():
     st.set_page_config(
         page_title="IDM Generator",
@@ -292,75 +386,87 @@ def main():
         layout="wide",
     )
 
-    st.title("IDM Generator")
-    st.caption("アップロードした音声から Aphex Twin / Squarepusher 風の IDM トラックを生成します。")
+    st.title("IDM Generator (Streamlit)")
+    st.caption(
+        "アップロードした曲を素材に、Aphex Twin / Squarepusher テイストの IDM トラックに自動変換します。"
+    )
 
     col_left, col_right = st.columns([1, 1.2])
 
     with col_left:
         uploaded_file = st.file_uploader(
-            "音声ファイルをアップロード（WAV 推奨）",
+            "元になる音源（WAV / MP3 など）",
             type=["wav", "mp3", "ogg", "flac", "m4a"],
         )
 
         if uploaded_file is not None:
             st.audio(uploaded_file, format="audio/*")
 
-        style = st.radio(
-            "サウンドスタイル",
-            ["Aphex Twin 風", "Squarepusher 風"],
-            help="ざっくりとした方向性の違いです。前者はアンビエント寄り、後者はブレイクビーツ寄り。"
-        )
+        style = st.radio("スタイル", ["Aphex Twin", "Squarepusher"])
 
         scale = st.selectbox(
-            "スケール（曲の雰囲気）",
+            "スケール（曲の雰囲気になる音階）",
             options=list(SCALES.keys()),
             index=0,
-            help="マイナー＝暗め、メジャー＝明るめ、ペンタトニック＝和風／ゲーム音楽っぽい…などのキャラクターを決めます。"
+            help="minor: 暗め / major: 明るめ / pentatonic: 和風 / それ以外は少しマニアックなモード音階です。",
         )
 
         seed = st.number_input(
-            "シード値（毎回のランダムパターン）",
+            "ランダムシード（同じ値なら同じ展開）",
             min_value=0,
             max_value=99999,
             value=42,
             step=1,
-            help="同じシード値なら、同じ設定でだいたい同じパターンが再現できます。"
         )
 
     with col_right:
-        st.subheader("リズムと長さ")
         tempo = st.slider(
-            "テンポ倍率（スピード）",
-            0.8, 2.5, 1.2, 0.1,
-            help="曲の速さをどれくらい上げるか／下げるか。1.0 が元の速さのイメージです。"
+            "テンポ（全体の速さ）",
+            0.8,
+            2.5,
+            1.2,
+            0.1,
+            help="1.0 が標準。値を上げるとブレイクビートやベースが速くなります。",
         )
-        duration = st.slider(
-            "生成するトラックの長さ（分）",
-            1, 8, 3, 1,
-            help="完成するトラックの再生時間です。長くすると処理時間も増えます。"
-        )
-
-        st.subheader("サウンドキャラクター")
         glitch = st.slider(
-            "グリッチ感（どれくらい音を崩すか）",
-            0.0, 1.0, 0.5, 0.05,
-            help="値を上げるほど、音が細かく切り刻まれたようなグリッチ感が強くなります。0 に近いと原曲寄り。"
+            "サンプリングの刻み具合（グリッチ感）",
+            0.0,
+            1.0,
+            0.6,
+            0.05,
+            help="原曲をどれくらい細かく切り刻んで再配置するか。高くするほどバグっぽい展開になります。",
         )
         bass = st.slider(
-            "低音の迫力（ベースの強さ）",
-            0.5, 3.0, 1.5, 0.1,
-            help="低音の存在感をどれくらい強くするかです。Squarepusher 風で特に効きやすいパラメータです。"
+            "ベースの太さ",
+            0.5,
+            3.0,
+            1.5,
+            0.1,
+            help="特に Squarepusher スタイルの低音の主張に効きます。Aphex スタイルでも少し影響します。",
         )
         complexity = st.slider(
-            "ビートの複雑さ",
-            1, 10, 5, 1,
-            help="値が大きいほど、ドラムパターンやメロディが細かく複雑になります。"
+            "リズム / メロディの複雑さ",
+            1,
+            10,
+            7,
+            1,
+            help="高くすると不規則なブレイクとメロディが増え、よりカオティックなIDMになります。",
         )
         atmosphere = st.slider(
-            "空間の広がり感（アンビエント成分）",
-            1, 10, 5, 1,
-            help="値が大きいほど、パッド／ドローンのような広がりのある音が増えます。Aphex Twin 風で特に効きやすいです。"
+            "空間・アンビエント感",
+            1,
+            10,
+            6,
+            1,
+            help="ドローンやパッドの厚み。Aphex 系の浮遊感・奥行きに効きます。",
+        )
+        duration = st.slider(
+            "生成時間（分）",
+            1,
+            8,
+            3,
+            1,
+            help="出力トラックのおおよその長さです。",
         )
 
         generate = st.button("IDMトラックを生成する")
@@ -369,52 +475,61 @@ def main():
         if uploaded_file is None:
             st.warning("先に音声ファイルをアップロードしてください。")
         else:
-            try:
-                with st.spinner("音声を読み込んでいます..."):
-                    audio, sr = load_audio_from_uploaded(uploaded_file)
+            with st.spinner("生成中..."):
+                try:
+                    # ファイルを一度バイト列として取得してから一時ファイルに保存
+                    file_bytes = uploaded_file.getvalue()
+                    if not file_bytes:
+                        st.error("アップロードされたファイルが空です。別のファイルを試してください。")
+                        return
 
-                if audio.size == 0:
-                    st.error("音声ファイルが空です。別のファイルを試してください。")
-                    return
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+                        tmp.write(file_bytes)
+                        tmp_path = tmp.name
 
-                with st.spinner("IDM トラックを生成しています..."):
-                    sr_out, processed = generate_idm_array(
-                        audio,
-                        sr,
-                        style,
-                        tempo,
-                        glitch,
-                        bass,
-                        duration,
-                        seed,
-                        scale,
-                        complexity,
-                        atmosphere,
+                    try:
+                        audio, sr = librosa.load(tmp_path, sr=None, mono=True)
+                    except Exception as e:
+                        st.error(f"音声ファイルの読み込みに失敗しました: {e}")
+                        return
+
+                    try:
+                        sr_out, processed = generate_idm_array(
+                            audio=audio,
+                            sr=sr,
+                            style=style,
+                            tempo=tempo,
+                            glitch=glitch,
+                            bass=bass,
+                            duration_min=duration,
+                            seed=seed,
+                            scale=scale,
+                            complexity=complexity,
+                            atmosphere=atmosphere,
+                        )
+                    except Exception as e:
+                        st.error(f"トラック生成中にエラーが発生しました: {e}")
+                        return
+
+                    # WAV バイナリに変換
+                    buffer = io.BytesIO()
+                    sf.write(buffer, processed, sr_out, format="WAV")
+                    buffer.seek(0)
+
+                    st.success("生成完了！")
+                    audio_bytes = buffer.read()
+                    st.audio(audio_bytes, format="audio/wav")
+
+                    # ダウンロード用にもう一度先頭に戻す
+                    buffer = io.BytesIO(audio_bytes)
+                    st.download_button(
+                        "WAV をダウンロード",
+                        data=buffer,
+                        file_name=f"idm_{style.replace(' ', '').lower()}_{seed}.wav",
+                        mime="audio/wav",
                     )
-
-                # WAV バイナリに変換
-                buffer = io.BytesIO()
-                sf.write(buffer, processed, sr_out, format="WAV")
-                buffer.seek(0)
-
-                st.success("生成完了！")
-                audio_bytes = buffer.read()
-                st.audio(audio_bytes, format="audio/wav")
-
-                # ダウンロード用にもう一度先頭に戻す
-                buffer = io.BytesIO(audio_bytes)
-                st.download_button(
-                    "WAV をダウンロード",
-                    data=buffer,
-                    file_name=f"idm_{style.replace(' ', '').replace('風', '')}_{seed}.wav",
-                    mime="audio/wav",
-                )
-
-            except Exception as e:
-                # ここであらゆる例外をキャッチしてメッセージ表示
-                st.error("トラック生成中にエラーが発生しました。設定やファイル形式を変えて再度お試しください。")
-                # 具体的な原因も下に表示（開発中に便利）
-                st.exception(e)
+                except Exception as e:
+                    st.error(f"予期しないエラーが発生しました: {e}")
 
 
 if __name__ == "__main__":
